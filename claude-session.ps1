@@ -176,6 +176,28 @@ function Start-D365Mcp([string]$url) {
     Write-Warn "d365 still isn't answering after 30 seconds - try 'd365fo-mcp start' by hand."
 }
 
+# Processes Claude started (the session remote-control spawns, MCP servers, shells) can outlive it
+# for a moment and keep files in the config folder open. Only children created while the parent
+# was alive are touched, so a reused PID never takes an unrelated process down with it.
+function Stop-ChildProcesses([int]$parentId, [datetime]$from, [datetime]$until) {
+    Get-CimInstance Win32_Process -Filter "ParentProcessId=$parentId" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CreationDate -ge $from -and $_.CreationDate -le $until } |
+        ForEach-Object {
+            Stop-ChildProcesses $_.ProcessId $_.CreationDate ([datetime]::Now)
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+}
+
+# Files can stay locked for a moment after their process exits (or while antivirus scans them).
+function Remove-Folder([string]$path) {
+    for ($i = 0; $i -lt 10; $i++) {
+        Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $path)) { return $true }
+        Start-Sleep -Milliseconds 700
+    }
+    return $false
+}
+
 function Get-ClaudeStatus {
     # In PowerShell 5.1 a native command's stderr becomes an error record: don't let it throw.
     $ErrorActionPreference = 'Continue'
@@ -447,8 +469,14 @@ finally {
     $ErrorActionPreference = 'Continue'
 
     # Give Claude time to archive the session before signing out; kill it if that's not enough.
-    if ($rc -and -not $rc.HasExited -and -not $rc.WaitForExit(30000)) {
-        taskkill /PID $rc.Id /T /F *> $null
+    if ($rc) {
+        if (-not $rc.HasExited -and -not $rc.WaitForExit(30000)) {
+            taskkill /PID $rc.Id /T /F *> $null
+        }
+        try {
+            $until = if ($rc.HasExited) { $rc.ExitTime } else { [datetime]::Now }
+            Stop-ChildProcesses $rc.Id $rc.StartTime $until
+        } catch { }
     }
 
     if ($dir) {
@@ -458,12 +486,18 @@ finally {
             Write-Ok "Signed out"
         }
         Remove-Item Env:CLAUDE_CONFIG_DIR, Env:BROWSER -ErrorAction SilentlyContinue
-        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 
-        if (Test-Path $dir) {
-            Write-Fail "Couldn't delete $dir - remove it by hand."
-        } else {
+        $credentials = Join-Path $dir '.credentials.json'
+        $clean = Remove-Folder $dir
+        if ($clean) {
             Write-Ok "Session files deleted"
+        } elseif (Test-Path $credentials) {
+            Write-Fail "Couldn't delete the login token: $credentials - remove it by hand."
+        } else {
+            # Login token already gone; leftovers are removed on the next run.
+            Write-Ok "Login token deleted"
+            Write-Warn "A few session files are still in use - they'll be removed on the next run."
+            Write-Dim $dir
         }
 
         $local = Join-Path $Project '.claude\settings.local.json'
@@ -471,7 +505,11 @@ finally {
             Write-Warn "$local exists (permissions saved from a session) - delete it if you don't need it."
         }
         Write-Host ""
-        Write-Host "  Done. Nothing from this session is left in your Claude config on this machine." -ForegroundColor Green
+        if ($clean) {
+            Write-Host "  Done. Nothing from this session is left in your Claude config on this machine." -ForegroundColor Green
+        } else {
+            Write-Host "  Done. You are signed out; leftover files will be cleaned up next time." -ForegroundColor Green
+        }
     }
     Write-Host ""
 }
