@@ -483,22 +483,20 @@ function Invoke-CodexDeviceLogin {
     return 'failed'
 }
 
-# The Codex daemon refuses to run, or be talked to, with administrator rights - and on LCS VMs the
-# admin account usually runs elevated. Then its commands run with a non-elevated copy of our token:
-# Administrators deny-only, medium integrity, like `runas /trustlevel:0x20000`, but in this console's
-# environment (CODEX_HOME included).
-function Test-Elevated {
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Initialize-LimitedProcess {
-    if ('LimitedProcess' -as [type]) { return }
+# The Codex daemon checks TokenIsElevated and refuses to run, or be talked to, from an elevated
+# process - and on LCS VMs the admin account often runs elevated. A restricted copy of our own
+# token keeps that flag, so Codex commands run with the token of this session's Explorer instead,
+# which is not elevated while UAC is on, and with this console's environment (CODEX_HOME included).
+function Initialize-ShellProcess {
+    if ('ShellProcess' -as [type]) { return }
     Add-Type @'
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-public static class LimitedProcess {
+using System.Text;
+public static class ShellProcess {
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct STARTUPINFO {
         public int cb; public string lpReserved, lpDesktop, lpTitle;
@@ -506,62 +504,105 @@ public static class LimitedProcess {
         public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
     }
     [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
-    [StructLayout(LayoutKind.Sequential)] struct TOKEN_MANDATORY_LABEL { public IntPtr Sid; public uint Attributes; }
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SaferCreateLevel(uint scope, uint level, uint flags, out IntPtr handle, IntPtr reserved);
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SaferComputeTokenFromLevel(IntPtr level, IntPtr inToken, out IntPtr outToken, uint flags, IntPtr reserved);
-    [DllImport("advapi32.dll")] static extern bool SaferCloseLevel(IntPtr handle);
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool ConvertStringSidToSid(string sid, out IntPtr psid);
-    [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TOKEN_MANDATORY_LABEL info, int length);
+    [DllImport("user32.dll")] static extern IntPtr GetShellWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr sa, int level, int type, out IntPtr newToken);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int cls, out int info, int length, out int returned);
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string app, string cmd, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
     [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
     [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle, uint code);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr handle);
+
+    // TokenElevation.TokenIsElevated, the flag Codex checks.
+    static bool IsElevated(IntPtr token) {
+        int elevated, returned;
+        if (!GetTokenInformation(token, 20, out elevated, 4, out returned)) throw new Win32Exception();
+        return elevated != 0;
+    }
+
+    public static bool CurrentIsElevated() {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x8, out token)) throw new Win32Exception();
+        try { return IsElevated(token); } finally { CloseHandle(token); }
+    }
+
+    // Primary token of Explorer in this session, or an exception saying why there isn't a usable one.
+    static IntPtr ShellToken() {
+        uint pid;
+        IntPtr hwnd = GetShellWindow();
+        if (hwnd == IntPtr.Zero || GetWindowThreadProcessId(hwnd, out pid) == 0 || pid == 0)
+            throw new InvalidOperationException("Explorer isn't running in this session.");
+        IntPtr process = OpenProcess(0x1000, false, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if (process == IntPtr.Zero) throw new Win32Exception();
+        IntPtr token, primary;
+        try {
+            if (!OpenProcessToken(process, 0x2 | 0x8, out token)) throw new Win32Exception(); // DUPLICATE | QUERY
+        } finally { CloseHandle(process); }
+        try {
+            if (IsElevated(token))
+                throw new InvalidOperationException("Explorer runs elevated too: UAC is off on this machine.");
+            // QUERY | DUPLICATE | ASSIGN_PRIMARY | ADJUST_DEFAULT | ADJUST_SESSIONID; impersonation, primary.
+            if (!DuplicateTokenEx(token, 0x8 | 0x2 | 0x1 | 0x80 | 0x100, IntPtr.Zero, 2, 1, out primary)) throw new Win32Exception();
+        } finally { CloseHandle(token); }
+        return primary;
+    }
+
+    static IntPtr EnvironmentBlock() {
+        var vars = Environment.GetEnvironmentVariables();
+        var keys = new List<string>();
+        foreach (DictionaryEntry e in vars) keys.Add((string)e.Key);
+        keys.Sort(StringComparer.OrdinalIgnoreCase);
+        var sb = new StringBuilder();
+        foreach (var k in keys) sb.Append(k).Append('=').Append((string)vars[k]).Append('\0');
+        sb.Append('\0');
+        return Marshal.StringToHGlobalUni(sb.ToString());
+    }
 
     // Runs commandLine without a window and waits for it; -1 if it doesn't end within timeoutMs.
     public static int Run(string commandLine, string cwd, int timeoutMs) {
-        IntPtr level, token;
-        // SAFER_SCOPEID_USER, SAFER_LEVELID_NORMALUSER, SAFER_LEVEL_OPEN
-        if (!SaferCreateLevel(2, 0x20000, 1, out level, IntPtr.Zero)) throw new Win32Exception();
+        IntPtr token = ShellToken();
+        IntPtr env = EnvironmentBlock();
         try {
-            if (!SaferComputeTokenFromLevel(level, IntPtr.Zero, out token, 0, IntPtr.Zero)) throw new Win32Exception();
-        } finally { SaferCloseLevel(level); }
-        try {
-            IntPtr sid;
-            if (ConvertStringSidToSid("S-1-16-8192", out sid)) {
-                // Medium integrity, as for a normal non-elevated process (SE_GROUP_INTEGRITY).
-                var label = new TOKEN_MANDATORY_LABEL { Sid = sid, Attributes = 0x20 };
-                SetTokenInformation(token, 25, ref label, Marshal.SizeOf(label) + GetLengthSid(sid));
-                LocalFree(sid);
-            }
             var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si);
             PROCESS_INFORMATION pi;
-            // CREATE_NO_WINDOW; a null environment means this process's environment.
-            if (!CreateProcessAsUser(token, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, cwd, ref si, out pi))
+            // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+            if (!CreateProcessWithTokenW(token, 0, null, commandLine, 0x08000000 | 0x400, env, cwd, ref si, out pi))
                 throw new Win32Exception();
             try {
                 if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) { TerminateProcess(pi.hProcess, 1); return -1; }
                 uint code; GetExitCodeProcess(pi.hProcess, out code);
                 return (int)code;
             } finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
-        } finally { CloseHandle(token); }
+        } finally { Marshal.FreeHGlobal(env); CloseHandle(token); }
     }
 }
 '@
 }
 
-# Runs a codex command and returns its output; non-elevated when this console is elevated.
-# Gives up after $seconds, so stop/logout can never hang the cleanup.
+function Test-Elevated {
+    Initialize-ShellProcess
+    return [ShellProcess]::CurrentIsElevated()
+}
+
+# Runs a codex command and returns its output; through Explorer's token when this console is
+# elevated. Gives up after $seconds, so stop/logout can never hang the cleanup.
 function Invoke-Codex([string]$arguments, [int]$seconds = 60) {
     $ErrorActionPreference = 'Continue'
     $out = Join-Path $dir ('codex-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log')
     $cmdLine = "cmd.exe /d /s /c `"`"$codex`" $arguments > `"$out`" 2>&1`""
     if ($script:elevated) {
-        Initialize-LimitedProcess
-        [LimitedProcess]::Run($cmdLine, $dir, $seconds * 1000) | Out-Null
+        try {
+            [ShellProcess]::Run($cmdLine, $dir, $seconds * 1000) | Out-Null
+        } catch {
+            $e = $_.Exception
+            if ($e.InnerException) { $e = $e.InnerException }
+            return "Couldn't start Codex without administrator rights: $($e.Message)"
+        }
     } else {
         $p = Start-Process -FilePath cmd.exe -ArgumentList ($cmdLine -replace '^cmd\.exe ', '') -WindowStyle Hidden -PassThru
         if (-not $p.WaitForExit($seconds * 1000)) { taskkill /PID $p.Id /T /F *> $null }
@@ -848,7 +889,7 @@ try {
         # The launcher's PID: while it runs, the next launcher leaves this folder alone.
         $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
         $remoteStarted = $true
-        if ($elevated) { Write-Dim "This console runs as administrator - Codex runs with a normal user token." }
+        if ($elevated) { Write-Dim "This console runs as administrator - Codex runs non-elevated, through Explorer." }
         $startOut = Invoke-Codex 'remote-control start --json' 120
         $state = $null
         $last = @($startOut -split "`n" | Where-Object { $_ -match '^\s*\{.*"status"' }) | Select-Object -Last 1
