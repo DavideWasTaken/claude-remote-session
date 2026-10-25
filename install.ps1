@@ -7,7 +7,15 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$repoRaw = 'https://raw.githubusercontent.com/DavideWasTaken/d365fo-claude-remote-session/main'
+$repo = 'DavideWasTaken/d365fo-claude-remote-session'
+# Download from the latest commit rather than /main: raw.githubusercontent.com caches /main for a few
+# minutes, so right after a push it can still serve the previous version.
+try {
+    $ref = (Invoke-RestMethod "https://api.github.com/repos/$repo/commits/main" -UseBasicParsing).sha
+} catch {
+    $ref = 'main'
+}
+$repoRaw = "https://raw.githubusercontent.com/$repo/$ref"
 $installDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'claude-remote-session'
 $desktop = [Environment]::GetFolderPath('Desktop')
 $script = Join-Path $installDir 'claude-session.ps1'
@@ -22,8 +30,9 @@ try {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
     $updating = Test-Path $script
     Invoke-WebRequest "$repoRaw/claude-session.ps1" -OutFile $script -UseBasicParsing
-    if ($updating) { Write-Host "  [ OK ] Script updated" -ForegroundColor Green }
-    else { Write-Host "  [ OK ] Script downloaded" -ForegroundColor Green }
+    $version = if ($ref -eq 'main') { 'main' } else { $ref.Substring(0, 7) }
+    if ($updating) { Write-Host "  [ OK ] Script updated ($version)" -ForegroundColor Green }
+    else { Write-Host "  [ OK ] Script downloaded ($version)" -ForegroundColor Green }
 
     # Keep the name on reinstall/update.
     if (-not (Test-Path $nameFile) -or -not (Get-Content $nameFile -Raw).Trim()) {
