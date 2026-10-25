@@ -8,7 +8,7 @@
 # 4. Signs in without opening the VM's browser: the link goes to the clipboard and the code
 #    is read here, masked.
 # 5. Starts `claude remote-control` under the chosen name, in bypass-permissions mode.
-# 6. When the session ends ("stop session", archived in the app, or Ctrl+C) it signs out and
+# 6. When the session ends (archived in the app, "stop session", or Ctrl+C) it signs out and
 #    deletes the throwaway folder.
 #
 # Usage:    double-click the launcher. Tell Claude which project to use from the chat
@@ -438,7 +438,8 @@ try {
     }
 
     # "stop session" in the chat creates stop.request: this script sees it and stops Claude
-    # cleanly (Ctrl+C), so the session gets archived instead of piling up in the app.
+    # cleanly (Ctrl+C). Claude Code keeps a session stopped that way for resuming, so it stays in
+    # the app as offline; archiving it from the app is what removes it from the list.
     $stopFile = Join-Path $dir 'stop.request'
     $stopScript = Join-Path $dir 'stop.ps1'
     "New-Item -ItemType File -Path '$stopFile' -Force | Out-Null" | Set-Content -Path $stopScript -Encoding ascii
@@ -448,8 +449,9 @@ try {
 - When the user names a project or a path ("use project X in Y"), work there, using absolute paths
   to read, edit and run commands. Use get_workspace_info from the d365 MCP to check that the MCP
   points at the same project, and tell the user if it doesn't.
-- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing,
-  then run in PowerShell: & '$stopScript'
+- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing and
+  that archiving this session in the app also removes it from their list, then run in PowerShell:
+  & '$stopScript'
   The remote session ends within a few seconds; the launcher then signs out and cleans up.
 "@ | Set-Content -Path (Join-Path $dir 'CLAUDE.md') -Encoding UTF8
 
@@ -496,7 +498,8 @@ try {
     Write-Host ""
     Write-Info "Open '$Name' from the Claude app on your computer."
     Write-Info "You can close RDP now with the X - do NOT sign out of Windows."
-    Write-Info "To end it: type 'stop session' in the chat, archive it in the app, or press Ctrl+C here."
+    Write-Info "To end it: archive the session in the app - that also removes it from your list."
+    Write-Dim "('stop session' in the chat or Ctrl+C here also work, but leave it listed as offline.)"
     Write-Host ""
 
     $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru

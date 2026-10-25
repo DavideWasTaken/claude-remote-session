@@ -27,7 +27,7 @@ This script lets you:
 3. **Finds your MCP servers** in the Claude Code and Claude Desktop configs (plus an optional `mcp.json` next to the script). If no `d365` server is configured it adds `http://127.0.0.1:8080/mcp`. If the server doesn't answer, it starts it with `d365fo-mcp start`.
 4. **Signs you in without touching the VM's browser.** The sign-in link is copied to the clipboard, which RDP shares with your PC: you open it on your own machine and paste the code back, masked with `*`.
 5. **Starts `claude remote-control`** with no permission prompts and no "Enable Remote Control?" question. It can access every local drive, so you just tell it which project to work on.
-6. **Cleans up when you're done:** clean shutdown so the session is archived, `claude auth logout`, and the temp folder is deleted. Leftovers from sessions that ended badly are removed on the next run.
+6. **Cleans up when you're done:** clean shutdown of Claude and its child processes, `claude auth logout`, and the temp folder is deleted, including paths longer than 260 characters. Leftovers from sessions that ended badly are removed on the next run.
 
 ## Requirements
 
@@ -62,7 +62,9 @@ If you'd rather install by hand, copy `claude-session.ps1` and `claude-session.c
 3. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 4. Open the session from the Claude app on your PC and tell it what to work on, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
-To end the session, type **"stop session"** in the chat, archive it from the app, or press Ctrl+C in the VM console. The script then signs out and deletes the temp folder.
+To end the session, **archive it from the Claude app**. In single-session mode Remote Control exits when its session ends, and the script then signs out and deletes the temp folder. Archiving is also what removes the session from your list.
+
+You can also type **"stop session"** in the chat or press Ctrl+C in the VM console. The cleanup is the same, but Claude Code deliberately keeps a session stopped this way so it can be resumed, so it stays in your list as offline until you archive it.
 
 The console walks you through five steps:
 
