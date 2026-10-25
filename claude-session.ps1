@@ -188,6 +188,51 @@ function Stop-ChildProcesses([int]$parentId, [datetime]$from, [datetime]$until) 
         }
 }
 
+# Asks Windows (Restart Manager) which processes have files in a folder open.
+function Get-LockingProcesses([string]$path) {
+    if (-not ('RmLocks' -as [type])) {
+        Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class RmLocks {
+    [StructLayout(LayoutKind.Sequential)]
+    struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+        public int ApplicationType; public uint AppStatus; public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+    }
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmStartSession(out uint handle, int flags, string key);
+    [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint handle);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)] static extern int RmRegisterResources(uint handle, uint nFiles, string[] files, uint nApps, RM_UNIQUE_PROCESS[] apps, uint nServices, string[] services);
+    [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint handle, out uint needed, ref uint count, [In, Out] RM_PROCESS_INFO[] info, ref uint reasons);
+    public static int[] Get(string[] files) {
+        var pids = new List<int>();
+        uint handle;
+        if (files.Length == 0 || RmStartSession(out handle, 0, Guid.NewGuid().ToString()) != 0) return pids.ToArray();
+        try {
+            if (RmRegisterResources(handle, (uint)files.Length, files, 0, null, 0, null) != 0) return pids.ToArray();
+            uint needed = 0, count = 0, reasons = 0;
+            if (RmGetList(handle, out needed, ref count, null, ref reasons) == 234 && needed > 0) {
+                var info = new RM_PROCESS_INFO[needed];
+                count = needed;
+                if (RmGetList(handle, out needed, ref count, info, ref reasons) == 0)
+                    for (int i = 0; i < count; i++) pids.Add(info[i].Process.dwProcessId);
+            }
+        } finally { RmEndSession(handle); }
+        return pids.ToArray();
+    }
+}
+'@
+    }
+    $files = @(Get-ChildItem $path -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    return @([RmLocks]::Get($files) | Select-Object -Unique | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+}
+
 # Files can stay locked for a moment after their process exits (or while antivirus scans them).
 function Remove-Folder([string]$path) {
     for ($i = 0; $i -lt 10; $i++) {
@@ -278,6 +323,7 @@ function Invoke-MaskedLogin {
 
 $dir = $null
 $rc = $null
+$rcStart = $null
 $claude = $null
 $justInstalled = $false
 $signInStarted = $false
@@ -448,6 +494,8 @@ try {
     Write-Host ""
 
     $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru
+    # Read now: once the process has exited, StartTime comes back empty.
+    $rcStart = $rc.StartTime
     $rc.Id | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
 
     while (-not $rc.WaitForExit(1000)) {
@@ -473,10 +521,7 @@ finally {
         if (-not $rc.HasExited -and -not $rc.WaitForExit(30000)) {
             taskkill /PID $rc.Id /T /F *> $null
         }
-        try {
-            $until = if ($rc.HasExited) { $rc.ExitTime } else { [datetime]::Now }
-            Stop-ChildProcesses $rc.Id $rc.StartTime $until
-        } catch { }
+        if ($rcStart) { Stop-ChildProcesses $rc.Id $rcStart ([datetime]::Now) }
     }
 
     if ($dir) {
@@ -489,6 +534,17 @@ finally {
 
         $credentials = Join-Path $dir '.credentials.json'
         $clean = Remove-Folder $dir
+        $lockers = @()
+        if (-not $clean) {
+            # Still locked: stop our own claude.exe processes holding files, then try again.
+            $lockers = @(Get-LockingProcesses $dir)
+            $ours = @($lockers | Where-Object { $_.Path -eq $claude })
+            if ($ours.Count) {
+                $ours | Stop-Process -Force -ErrorAction SilentlyContinue
+                $clean = Remove-Folder $dir
+                if (-not $clean) { $lockers = @(Get-LockingProcesses $dir) }
+            }
+        }
         if ($clean) {
             Write-Ok "Session files deleted"
         } elseif (Test-Path $credentials) {
@@ -497,6 +553,9 @@ finally {
             # Login token already gone; leftovers are removed on the next run.
             Write-Ok "Login token deleted"
             Write-Warn "A few session files are still in use - they'll be removed on the next run."
+            if ($lockers.Count) {
+                Write-Dim ("Held by: " + (($lockers | ForEach-Object { "$($_.ProcessName) ($($_.Id))" }) -join ', '))
+            }
             Write-Dim $dir
         }
 
