@@ -92,3 +92,7 @@ This reduces exposure a lot, but on a machine where others are administrators it
 - **Make sure your contract allows** sending the customer's code to an AI service.
 
 Console messages and the in-session instructions are in Italian.
+
+## License
+
+[MIT](LICENSE)
