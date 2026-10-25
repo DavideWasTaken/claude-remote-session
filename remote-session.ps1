@@ -483,10 +483,98 @@ function Invoke-CodexDeviceLogin {
     return 'failed'
 }
 
+# The Codex daemon refuses to run, or be talked to, with administrator rights - and on LCS VMs the
+# admin account usually runs elevated. Then its commands run with a non-elevated copy of our token:
+# Administrators deny-only, medium integrity, like `runas /trustlevel:0x20000`, but in this console's
+# environment (CODEX_HOME included).
+function Test-Elevated {
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Initialize-LimitedProcess {
+    if ('LimitedProcess' -as [type]) { return }
+    Add-Type @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class LimitedProcess {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO {
+        public int cb; public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    [StructLayout(LayoutKind.Sequential)] struct TOKEN_MANDATORY_LABEL { public IntPtr Sid; public uint Attributes; }
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SaferCreateLevel(uint scope, uint level, uint flags, out IntPtr handle, IntPtr reserved);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SaferComputeTokenFromLevel(IntPtr level, IntPtr inToken, out IntPtr outToken, uint flags, IntPtr reserved);
+    [DllImport("advapi32.dll")] static extern bool SaferCloseLevel(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool ConvertStringSidToSid(string sid, out IntPtr psid);
+    [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TOKEN_MANDATORY_LABEL info, int length);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
+    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr handle);
+
+    // Runs commandLine without a window and waits for it; -1 if it doesn't end within timeoutMs.
+    public static int Run(string commandLine, string cwd, int timeoutMs) {
+        IntPtr level, token;
+        // SAFER_SCOPEID_USER, SAFER_LEVELID_NORMALUSER, SAFER_LEVEL_OPEN
+        if (!SaferCreateLevel(2, 0x20000, 1, out level, IntPtr.Zero)) throw new Win32Exception();
+        try {
+            if (!SaferComputeTokenFromLevel(level, IntPtr.Zero, out token, 0, IntPtr.Zero)) throw new Win32Exception();
+        } finally { SaferCloseLevel(level); }
+        try {
+            IntPtr sid;
+            if (ConvertStringSidToSid("S-1-16-8192", out sid)) {
+                // Medium integrity, as for a normal non-elevated process (SE_GROUP_INTEGRITY).
+                var label = new TOKEN_MANDATORY_LABEL { Sid = sid, Attributes = 0x20 };
+                SetTokenInformation(token, 25, ref label, Marshal.SizeOf(label) + GetLengthSid(sid));
+                LocalFree(sid);
+            }
+            var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si);
+            PROCESS_INFORMATION pi;
+            // CREATE_NO_WINDOW; a null environment means this process's environment.
+            if (!CreateProcessAsUser(token, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, cwd, ref si, out pi))
+                throw new Win32Exception();
+            try {
+                if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) { TerminateProcess(pi.hProcess, 1); return -1; }
+                uint code; GetExitCodeProcess(pi.hProcess, out code);
+                return (int)code;
+            } finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+        } finally { CloseHandle(token); }
+    }
+}
+'@
+}
+
+# Runs a codex command and returns its output; non-elevated when this console is elevated.
+# Gives up after $seconds, so stop/logout can never hang the cleanup.
+function Invoke-Codex([string]$arguments, [int]$seconds = 60) {
+    $ErrorActionPreference = 'Continue'
+    $out = Join-Path $dir ('codex-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log')
+    $cmdLine = "cmd.exe /d /s /c `"`"$codex`" $arguments > `"$out`" 2>&1`""
+    if ($script:elevated) {
+        Initialize-LimitedProcess
+        [LimitedProcess]::Run($cmdLine, $dir, $seconds * 1000) | Out-Null
+    } else {
+        $p = Start-Process -FilePath cmd.exe -ArgumentList ($cmdLine -replace '^cmd\.exe ', '') -WindowStyle Hidden -PassThru
+        if (-not $p.WaitForExit($seconds * 1000)) { taskkill /PID $p.Id /T /F *> $null }
+    }
+    $text = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
+    # The daemon `start` launches can keep the file open: it goes with the folder at the end.
+    Remove-Item $out -ErrorAction SilentlyContinue
+    return ([string]$text -replace '\x1b\[[0-9;]*m', '')
+}
+
 # Creates a short-lived pairing code for the ChatGPT app and copies it to the clipboard.
 function Show-PairingCode {
-    $ErrorActionPreference = 'Continue'
-    $out = ((& $codex remote-control pair 2>&1) -join "`n") -replace '\x1b\[[0-9;]*m', ''
+    $out = Invoke-Codex 'remote-control pair'
     if ($out -match 'Pairing code:\s*(\S+)') {
         Set-Clipboard -Value $Matches[1]
         Write-Ok "Pairing code: $($Matches[1])  (copied to the clipboard)"
@@ -494,12 +582,6 @@ function Show-PairingCode {
         Write-Warn "Couldn't create a pairing code:"
         Write-Dim $out.Trim()
     }
-}
-
-# Runs a codex command in a hidden window and gives up after $seconds (stop must never hang cleanup).
-function Invoke-CodexQuiet([string]$arguments, [int]$seconds = 30) {
-    $p = Start-Process -FilePath $codex -ArgumentList $arguments -WindowStyle Hidden -PassThru
-    if (-not $p.WaitForExit($seconds * 1000)) { taskkill /PID $p.Id /T /F *> $null }
 }
 
 # ---------------------------------------------------------------- main
@@ -547,6 +629,7 @@ if (-not $Name) {
 if ($changed) { Save-SessionSettings $settings }
 
 $isCodex = $Agent -eq 'codex'
+$elevated = $isCodex -and (Test-Elevated)
 $prefix = if ($isCodex) { 'codex-rs-' } else { 'cc-session-' }
 $agentName = if ($isCodex) { 'Codex' } else { 'Claude Code' }
 
@@ -765,9 +848,8 @@ try {
         # The launcher's PID: while it runs, the next launcher leaves this folder alone.
         $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
         $remoteStarted = $true
-        $ErrorActionPreference = 'Continue'
-        $startOut = ((& $codex remote-control start --json 2>&1) -join "`n") -replace '\x1b\[[0-9;]*m', ''
-        $ErrorActionPreference = 'Stop'
+        if ($elevated) { Write-Dim "This console runs as administrator - Codex runs with a normal user token." }
+        $startOut = Invoke-Codex 'remote-control start --json' 120
         $state = $null
         $last = @($startOut -split "`n" | Where-Object { $_ -match '^\s*\{.*"status"' }) | Select-Object -Last 1
         if ($last) { $state = $json.DeserializeObject($last) }
@@ -847,12 +929,12 @@ finally {
         if ($isCodex) {
             # Stop the daemon before signing out, then anything still running from the folder.
             if ($remoteStarted) {
-                Invoke-CodexQuiet 'remote-control stop'
+                Invoke-Codex 'remote-control stop' 30 | Out-Null
                 Write-Ok "Remote control stopped"
             }
             Stop-ProcessesUnder $dir
             if ($signInStarted -and $codex) {
-                Invoke-CodexQuiet 'logout'
+                Invoke-Codex 'logout' 30 | Out-Null
                 Write-Ok "Signed out"
             }
             Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
