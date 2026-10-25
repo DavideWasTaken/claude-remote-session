@@ -101,8 +101,7 @@ function Remove-StaleSessions {
             $oldPid = [int](Get-Content $pidFile)
             if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) { return }
         }
-        Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-        $removed++
+        if (Remove-Folder $_.FullName 1) { $removed++ }
     }
     return $removed
 }
@@ -233,12 +232,19 @@ public static class RmLocks {
     return @([RmLocks]::Get($files) | Select-Object -Unique | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
 }
 
-# Files can stay locked for a moment after their process exits (or while antivirus scans them).
-function Remove-Folder([string]$path) {
-    for ($i = 0; $i -lt 10; $i++) {
-        Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path $path)) { return $true }
-        Start-Sleep -Milliseconds 700
+# Deletes a folder even when paths inside are longer than 260 characters: Claude Code syncs your
+# account's skills and plugins into deep folders that Remove-Item in PowerShell 5.1 can't reach.
+# The \\?\ prefix lifts that limit. Retries because files can stay locked for a moment after their
+# process exits (or while antivirus scans them).
+function Remove-Folder([string]$path, [int]$attempts = 10) {
+    # Only ever our own session folders, never an empty or relative path.
+    if (-not [IO.Path]::IsPathRooted($path) -or (Split-Path $path -Leaf) -notlike "$prefix*") { return $false }
+    for ($i = 0; $i -lt $attempts; $i++) {
+        if (Test-Path -LiteralPath $path) {
+            cmd.exe /d /c "rd /s /q `"\\?\$path`"" *> $null
+        }
+        if (-not (Test-Path -LiteralPath $path)) { return $true }
+        if ($i -lt $attempts - 1) { Start-Sleep -Milliseconds 700 }
     }
     return $false
 }
