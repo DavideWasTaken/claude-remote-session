@@ -483,145 +483,166 @@ function Invoke-CodexDeviceLogin {
     return 'failed'
 }
 
-# The Codex daemon checks TokenIsElevated and refuses to run, or be talked to, from an elevated
-# process - and on LCS VMs the admin account often runs elevated. A restricted copy of our own
-# token keeps that flag, so Codex commands run with the token of this session's Explorer instead,
-# which is not elevated while UAC is on, and with this console's environment (CODEX_HOME included).
-function Initialize-ShellProcess {
-    if ('ShellProcess' -as [type]) { return }
+# `codex remote-control pair` only talks to the background daemon, and on Windows the daemon refuses
+# to run from an elevated process - LCS VMs run the admin account elevated, often with UAC off, so
+# there is no non-elevated token to use. Codex itself falls back to a foreground server in that
+# case, so the script always runs that one (--no-daemon) and asks its socket for the pairing code
+# with the same request the CLI sends: a WebSocket over the Unix socket, `initialize`, then
+# `remoteControl/pairing/start` with manualCode.
+function Initialize-CodexPairing {
+    if ('CodexPairing' -as [type]) { return }
     Add-Type @'
 using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
-public static class ShellProcess {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct STARTUPINFO {
-        public int cb; public string lpReserved, lpDesktop, lpTitle;
-        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
-        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
-    [DllImport("user32.dll")] static extern IntPtr GetShellWindow();
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr sa, int level, int type, out IntPtr newToken);
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int cls, out int info, int length, out int returned);
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string app, string cmd, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
-    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
-    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
-    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr handle, uint code);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
-
-    // TokenElevation.TokenIsElevated, the flag Codex checks.
-    static bool IsElevated(IntPtr token) {
-        int elevated, returned;
-        if (!GetTokenInformation(token, 20, out elevated, 4, out returned)) throw new Win32Exception();
-        return elevated != 0;
+using System.Text.RegularExpressions;
+public static class CodexPairing {
+    class UnixEndPoint : EndPoint {
+        readonly string path;
+        public UnixEndPoint(string path) { this.path = path; }
+        public override AddressFamily AddressFamily { get { return AddressFamily.Unix; } }
+        public override SocketAddress Serialize() {
+            // sockaddr_un: 2-byte family, then a NUL-terminated path of up to 108 bytes.
+            var bytes = Encoding.UTF8.GetBytes(path);
+            var address = new SocketAddress(AddressFamily.Unix, 110);
+            for (int i = 0; i < bytes.Length && i < 107; i++) address[2 + i] = bytes[i];
+            return address;
+        }
+        public override EndPoint Create(SocketAddress address) { return this; }
     }
 
-    public static bool CurrentIsElevated() {
-        IntPtr token;
-        if (!OpenProcessToken(GetCurrentProcess(), 0x8, out token)) throw new Win32Exception();
-        try { return IsElevated(token); } finally { CloseHandle(token); }
+    static void ReadExactly(Stream stream, byte[] buffer, int count) {
+        for (int read = 0; read < count; ) {
+            int n = stream.Read(buffer, read, count - read);
+            if (n <= 0) throw new IOException("Codex closed the socket.");
+            read += n;
+        }
     }
 
-    // Primary token of Explorer in this session, or an exception saying why there isn't a usable one.
-    static IntPtr ShellToken() {
-        uint pid;
-        IntPtr hwnd = GetShellWindow();
-        if (hwnd == IntPtr.Zero || GetWindowThreadProcessId(hwnd, out pid) == 0 || pid == 0)
-            throw new InvalidOperationException("Explorer isn't running in this session.");
-        IntPtr process = OpenProcess(0x1000, false, pid); // PROCESS_QUERY_LIMITED_INFORMATION
-        if (process == IntPtr.Zero) throw new Win32Exception();
-        IntPtr token, primary;
-        try {
-            if (!OpenProcessToken(process, 0x2 | 0x8, out token)) throw new Win32Exception(); // DUPLICATE | QUERY
-        } finally { CloseHandle(process); }
-        try {
-            if (IsElevated(token))
-                throw new InvalidOperationException("Explorer runs elevated too: UAC is off on this machine.");
-            // QUERY | DUPLICATE | ASSIGN_PRIMARY | ADJUST_DEFAULT | ADJUST_SESSIONID; impersonation, primary.
-            if (!DuplicateTokenEx(token, 0x8 | 0x2 | 0x1 | 0x80 | 0x100, IntPtr.Zero, 2, 1, out primary)) throw new Win32Exception();
-        } finally { CloseHandle(token); }
-        return primary;
+    // One masked text frame, as a WebSocket client must send.
+    static void Send(Stream stream, string text) {
+        var payload = Encoding.UTF8.GetBytes(text);
+        var frame = new MemoryStream();
+        frame.WriteByte(0x81);
+        if (payload.Length < 126) {
+            frame.WriteByte((byte)(0x80 | payload.Length));
+        } else {
+            frame.WriteByte(0x80 | 126);
+            frame.WriteByte((byte)(payload.Length >> 8));
+            frame.WriteByte((byte)payload.Length);
+        }
+        var mask = new byte[4];
+        new RNGCryptoServiceProvider().GetBytes(mask);
+        frame.Write(mask, 0, 4);
+        for (int i = 0; i < payload.Length; i++) frame.WriteByte((byte)(payload[i] ^ mask[i % 4]));
+        var bytes = frame.ToArray();
+        stream.Write(bytes, 0, bytes.Length);
     }
 
-    static IntPtr EnvironmentBlock() {
-        var vars = Environment.GetEnvironmentVariables();
-        var keys = new List<string>();
-        foreach (DictionaryEntry e in vars) keys.Add((string)e.Key);
-        keys.Sort(StringComparer.OrdinalIgnoreCase);
-        var sb = new StringBuilder();
-        foreach (var k in keys) sb.Append(k).Append('=').Append((string)vars[k]).Append('\0');
-        sb.Append('\0');
-        return Marshal.StringToHGlobalUni(sb.ToString());
+    // Next text message; pings are answered, other control frames skipped.
+    static string Receive(Stream stream) {
+        var message = new MemoryStream();
+        var header = new byte[2];
+        while (true) {
+            ReadExactly(stream, header, 2);
+            int opcode = header[0] & 0x0F;
+            bool fin = (header[0] & 0x80) != 0;
+            long length = header[1] & 0x7F;
+            if (length == 126) {
+                var ext = new byte[2]; ReadExactly(stream, ext, 2);
+                length = (ext[0] << 8) | ext[1];
+            } else if (length == 127) {
+                var ext = new byte[8]; ReadExactly(stream, ext, 8);
+                length = 0;
+                for (int i = 0; i < 8; i++) length = (length << 8) | ext[i];
+            }
+            var mask = new byte[4];
+            if ((header[1] & 0x80) != 0) ReadExactly(stream, mask, 4);
+            var payload = new byte[length];
+            ReadExactly(stream, payload, (int)length);
+            if ((header[1] & 0x80) != 0) for (int i = 0; i < payload.Length; i++) payload[i] ^= mask[i % 4];
+            if (opcode == 8) throw new IOException("Codex closed the connection.");
+            if (opcode == 9) {
+                var pong = new byte[] { 0x8A, 0x80, 0, 0, 0, 0 };
+                stream.Write(pong, 0, pong.Length);
+                continue;
+            }
+            if (opcode == 1 || opcode == 0) {
+                message.Write(payload, 0, payload.Length);
+                if (fin) return Encoding.UTF8.GetString(message.ToArray());
+            }
+        }
     }
 
-    // Runs commandLine without a window and waits for it; -1 if it doesn't end within timeoutMs.
-    public static int Run(string commandLine, string cwd, int timeoutMs) {
-        IntPtr token = ShellToken();
-        IntPtr env = EnvironmentBlock();
-        try {
-            var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si);
-            PROCESS_INFORMATION pi;
-            // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
-            if (!CreateProcessWithTokenW(token, 0, null, commandLine, 0x08000000 | 0x400, env, cwd, ref si, out pi))
-                throw new Win32Exception();
-            try {
-                if (WaitForSingleObject(pi.hProcess, (uint)timeoutMs) != 0) { TerminateProcess(pi.hProcess, 1); return -1; }
-                uint code; GetExitCodeProcess(pi.hProcess, out code);
-                return (int)code;
-            } finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
-        } finally { Marshal.FreeHGlobal(env); CloseHandle(token); }
+    static string WaitForResponse(Stream stream, int id) {
+        var pattern = new Regex("\"id\"\\s*:\\s*" + id + "\\s*[,}]");
+        while (true) {
+            var message = Receive(stream);
+            if (pattern.IsMatch(message) && !message.Contains("\"method\"")) return message;
+        }
+    }
+
+    // Returns the JSON-RPC response of remoteControl/pairing/start.
+    public static string Start(string socketPath, string version) {
+        using (var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)) {
+            socket.ReceiveTimeout = 20000;
+            socket.SendTimeout = 20000;
+            socket.Connect(new UnixEndPoint(socketPath));
+            using (var stream = new NetworkStream(socket)) {
+                var key = new byte[16];
+                new RNGCryptoServiceProvider().GetBytes(key);
+                var request = "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+                    "Sec-WebSocket-Key: " + Convert.ToBase64String(key) + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+                var bytes = Encoding.ASCII.GetBytes(request);
+                stream.Write(bytes, 0, bytes.Length);
+                var response = new StringBuilder();
+                var one = new byte[1];
+                while (!response.ToString().EndsWith("\r\n\r\n")) {
+                    ReadExactly(stream, one, 1);
+                    response.Append((char)one[0]);
+                }
+                if (!response.ToString().StartsWith("HTTP/1.1 101"))
+                    throw new IOException("WebSocket upgrade refused: " + response.ToString().Split('\r')[0]);
+
+                Send(stream, "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"codex_app_server_daemon\"," +
+                    "\"title\":\"d365fo-remote-session\",\"version\":\"" + version + "\"},\"capabilities\":{\"experimentalApi\":true}}}");
+                WaitForResponse(stream, 1);
+                Send(stream, "{\"method\":\"initialized\"}");
+                Send(stream, "{\"id\":2,\"method\":\"remoteControl/pairing/start\",\"params\":{\"manualCode\":true}}");
+                return WaitForResponse(stream, 2);
+            }
+        }
     }
 }
 '@
 }
 
-function Test-Elevated {
-    Initialize-ShellProcess
-    return [ShellProcess]::CurrentIsElevated()
-}
-
-# Runs a codex command and returns its output; through Explorer's token when this console is
-# elevated. Gives up after $seconds, so stop/logout can never hang the cleanup.
-function Invoke-Codex([string]$arguments, [int]$seconds = 60) {
-    $ErrorActionPreference = 'Continue'
-    $out = Join-Path $dir ('codex-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log')
-    $cmdLine = "cmd.exe /d /s /c `"`"$codex`" $arguments > `"$out`" 2>&1`""
-    if ($script:elevated) {
+# Creates a short-lived pairing code for the ChatGPT app and copies it to the clipboard.
+function Show-PairingCode {
+    $socket = Get-ChildItem (Join-Path $codexTemp 'codex-remote-control') -Filter '*.sock' -Force -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $code = $null
+    $problem = 'the remote-control socket was not found'
+    if ($socket) {
         try {
-            [ShellProcess]::Run($cmdLine, $dir, $seconds * 1000) | Out-Null
+            Initialize-CodexPairing
+            $response = $json.DeserializeObject([CodexPairing]::Start($socket.FullName, $version))
+            if ($response.ContainsKey('result')) { $code = $response['result']['manualPairingCode'] }
+            elseif ($response.ContainsKey('error')) { $problem = $response['error']['message'] }
         } catch {
             $e = $_.Exception
             if ($e.InnerException) { $e = $e.InnerException }
-            return "Couldn't start Codex without administrator rights: $($e.Message)"
+            $problem = $e.Message
         }
-    } else {
-        $p = Start-Process -FilePath cmd.exe -ArgumentList ($cmdLine -replace '^cmd\.exe ', '') -WindowStyle Hidden -PassThru
-        if (-not $p.WaitForExit($seconds * 1000)) { taskkill /PID $p.Id /T /F *> $null }
     }
-    $text = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
-    # The daemon `start` launches can keep the file open: it goes with the folder at the end.
-    Remove-Item $out -ErrorAction SilentlyContinue
-    return ([string]$text -replace '\x1b\[[0-9;]*m', '')
-}
-
-# Creates a short-lived pairing code for the ChatGPT app and copies it to the clipboard.
-function Show-PairingCode {
-    $out = Invoke-Codex 'remote-control pair'
-    if ($out -match 'Pairing code:\s*(\S+)') {
-        Set-Clipboard -Value $Matches[1]
-        Write-Ok "Pairing code: $($Matches[1])  (copied to the clipboard)"
+    if ($code) {
+        Set-Clipboard -Value $code
+        Write-Ok "Pairing code: $code  (copied to the clipboard)"
     } else {
-        Write-Warn "Couldn't create a pairing code:"
-        Write-Dim $out.Trim()
+        Write-Warn "Couldn't create a pairing code: $problem"
     }
 }
 
@@ -633,7 +654,7 @@ $rcStart = $null
 $claude = $null
 $codex = $null
 $loginProc = $null
-$remoteStarted = $false
+$codexTemp = $null
 $justInstalled = $false
 $signInStarted = $false
 
@@ -670,7 +691,6 @@ if (-not $Name) {
 if ($changed) { Save-SessionSettings $settings }
 
 $isCodex = $Agent -eq 'codex'
-$elevated = $isCodex -and (Test-Elevated)
 $prefix = if ($isCodex) { 'codex-rs-' } else { 'cc-session-' }
 $agentName = if ($isCodex) { 'Codex' } else { 'Claude Code' }
 
@@ -888,18 +908,53 @@ try {
     if ($isCodex) {
         # The launcher's PID: while it runs, the next launcher leaves this folder alone.
         $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
-        $remoteStarted = $true
-        if ($elevated) { Write-Dim "This console runs as administrator - Codex runs non-elevated, through Explorer." }
-        $startOut = Invoke-Codex 'remote-control start --json' 120
-        $state = $null
-        $last = @($startOut -split "`n" | Where-Object { $_ -match '^\s*\{.*"status"' }) | Select-Object -Last 1
-        if ($last) { $state = $json.DeserializeObject($last) }
-        if (-not $state -or $state['status'] -ne 'connected') {
-            Write-Dim $startOut.Trim()
+
+        # Run codex.exe (or codex.js under node) rather than the codex.cmd shim: Ctrl+C on a batch
+        # file asks "Terminate batch job (Y/N)?" and would hang the shutdown.
+        $rcFile = $codex
+        $rcArgs = 'remote-control --no-daemon'
+        if ($codex -notlike '*.exe') {
+            $package = Join-Path (Split-Path $codex) 'node_modules\@openai\codex'
+            $native = Get-ChildItem $package -Recurse -Filter 'codex.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $codexJs = Join-Path $package 'bin\codex.js'
+            if ($native) { $rcFile = $native.FullName }
+            elseif ((Test-Path $codexJs) -and (Get-Command node -ErrorAction SilentlyContinue)) {
+                $rcFile = (Get-Command node).Source
+                $rcArgs = "`"$codexJs`" $rcArgs"
+            }
+        }
+
+        # The foreground server puts its socket in %TEMP%\codex-remote-control: a TEMP of its own in
+        # the session folder keeps that path short, private and easy to find for the pairing code.
+        $codexTemp = Join-Path $dir 't'
+        New-Item -ItemType Directory -Path $codexTemp | Out-Null
+        $rcLog = Join-Path $dir 'remote-control.log'
+        $rcErr = Join-Path $dir 'remote-control.err'
+        $savedTemp = $env:TEMP, $env:TMP
+        $env:TEMP = $codexTemp
+        $env:TMP = $codexTemp
+        try {
+            $rc = Start-Process -FilePath $rcFile -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru `
+                -RedirectStandardOutput $rcLog -RedirectStandardError $rcErr
+        } finally {
+            $env:TEMP, $env:TMP = $savedTemp
+        }
+        # Read now: once the process has exited, StartTime comes back empty.
+        $rcStart = $rc.StartTime
+
+        $serverName = $null
+        for ($i = 0; $i -lt 120 -and -not $serverName -and -not $rc.HasExited; $i++) {
+            Start-Sleep -Milliseconds 500
+            $log = Get-Content $rcLog -Raw -ErrorAction SilentlyContinue
+            if ($log -match 'available for remote control as (.+?)\.?\s*(\r?\n|$)') { $serverName = $Matches[1] }
+        }
+        if (-not $serverName) {
+            $log = ((Get-Content $rcLog, $rcErr -Raw -ErrorAction SilentlyContinue) -join "`n") -replace '\x1b\[[0-9;]*m', ''
+            if ($log.Trim()) { Write-Dim $log.Trim() }
             throw "Codex remote control didn't start."
         }
+
         # Codex has no session name: the app lists this machine under its computer name.
-        $serverName = $state['serverName']
         Write-Field 'Machine' "$serverName  (Codex shows the computer name, not '$Name')"
         Write-Field 'Mode' 'never ask for approval, no sandbox'
         Write-Host ""
@@ -910,15 +965,24 @@ try {
         Write-Dim "P here makes a new pairing code if this one expired."
         Write-Host ""
 
-        while ($true) {
-            if (Test-Path $stopFile) { Write-Section "Stop requested from the session - shutting down..."; break }
-            if (-not (Test-Path $authFile)) { Write-Section "Signed out from the app - shutting down..."; break }
+        while (-not $rc.HasExited) {
+            $reason = $null
             $key = $null
             try { if ([Console]::KeyAvailable) { $key = [Console]::ReadKey($true).Key } } catch { }
             if ($key -eq 'P') { Show-PairingCode }
-            if ($key -eq 'Q') { Write-Section "Shutting down..."; break }
+            if ($key -eq 'Q') { $reason = "Shutting down..." }
+            if (Test-Path $stopFile) { $reason = "Stop requested from the session - shutting down..." }
+            if (-not (Test-Path $authFile)) { $reason = "Signed out from the app - shutting down..." }
+            if ($reason) {
+                Write-Section $reason
+                # Ctrl+C stops Codex cleanly and also reaches this script, which goes to the finally block.
+                [Win32.ConsoleCtrl]::GenerateConsoleCtrlEvent(0, 0) | Out-Null
+                $rc.WaitForExit(15000) | Out-Null
+                break
+            }
             Start-Sleep -Milliseconds 500
         }
+        if ($rc.HasExited -and -not $reason) { Write-Section "Codex remote control stopped - cleaning up..." }
     } else {
         $rcArgs = "remote-control --name `"$Name`" --spawn session --permission-mode bypassPermissions"
         Write-Field 'Session' $Name
@@ -954,9 +1018,10 @@ finally {
     # Cleanup must always run to the end, whatever the native commands print on stderr.
     $ErrorActionPreference = 'Continue'
 
-    # Give Claude time to archive the session before signing out; kill it if that's not enough.
+    # Give Claude time to archive the session before signing out (Codex time to stop after Ctrl+C);
+    # kill it if that's not enough.
     if ($rc) {
-        if (-not $rc.HasExited -and -not $rc.WaitForExit(30000)) {
+        if (-not $rc.HasExited -and -not $rc.WaitForExit($(if ($isCodex) { 10000 } else { 30000 }))) {
             taskkill /PID $rc.Id /T /F *> $null
         }
         if ($rcStart) { Stop-ChildProcesses $rc.Id $rcStart ([datetime]::Now) }
@@ -968,14 +1033,11 @@ finally {
     if ($dir) {
         Write-Section "Cleaning up"
         if ($isCodex) {
-            # Stop the daemon before signing out, then anything still running from the folder.
-            if ($remoteStarted) {
-                Invoke-Codex 'remote-control stop' 30 | Out-Null
-                Write-Ok "Remote control stopped"
-            }
+            if ($rc) { Write-Ok "Remote control stopped" }
+            # A daemon left by an older version of this script would run from the folder.
             Stop-ProcessesUnder $dir
             if ($signInStarted -and $codex) {
-                Invoke-Codex 'logout' 30 | Out-Null
+                & $codex logout *> $null
                 Write-Ok "Signed out"
             }
             Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue

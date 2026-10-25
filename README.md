@@ -28,8 +28,8 @@ This script lets you:
 2. **Creates a throwaway config folder** in `%TEMP%` and points `CLAUDE_CONFIG_DIR` or `CODEX_HOME` at it, so nothing is written to `%USERPROFILE%\.claude` or `\.codex`.
 3. **Finds your MCP servers** in the Claude Code and Claude Desktop configs (plus an optional `mcp.json` next to the script). If no `d365` server is configured it adds `http://127.0.0.1:8080/mcp`. If the server doesn't answer, it starts it with `d365fo-mcp start`.
 4. **Signs you in without touching the VM's browser.** The sign-in link is copied to the clipboard, which RDP shares with your PC. Claude: open it on your own machine and paste the code back, masked with `*`. Codex: open it on your own machine and type the code the console shows (device code sign-in), nothing is typed on the VM.
-5. **Starts the remote session** with no permission prompts. Claude: `claude remote-control`, with no "Enable Remote Control?" question. Codex: `codex remote-control` with `approval_policy = "never"` and no sandbox, plus a pairing code for the ChatGPT app. It can access every local drive, so you just tell it which project to work on.
-6. **Cleans up when you're done:** clean shutdown of the agent and its child processes (for Codex, the remote-control daemon too), sign-out, and the temp folder is deleted, including paths longer than 260 characters. Leftovers from sessions that ended badly are removed on the next run.
+5. **Starts the remote session** with no permission prompts. Claude: `claude remote-control`, with no "Enable Remote Control?" question. Codex: `codex remote-control --no-daemon` with `approval_policy = "never"` and no sandbox, plus a pairing code for the ChatGPT app. It can access every local drive, so you just tell it which project to work on.
+6. **Cleans up when you're done:** clean shutdown of the agent and its child processes (for Codex, its remote-control server too), sign-out, and the temp folder is deleted, including paths longer than 260 characters. Leftovers from sessions that ended badly are removed on the next run.
 
 ## Requirements
 
@@ -84,7 +84,7 @@ You can also type **"stop session"** in the chat or press Ctrl+C in the VM conso
 4. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 5. Pick the VM in the app (it's listed under its **computer name**: Codex has no session name) and start a thread, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
-To end the session, type **"stop session"** in the chat, press **Q** or Ctrl+C in the VM console, or sign out of Codex from the app. The script stops the remote-control daemon, signs out and deletes the temp folder.
+To end the session, type **"stop session"** in the chat, press **Q** or Ctrl+C in the VM console, or sign out of Codex from the app. The script stops Codex, signs out and deletes the temp folder.
 
 ### Console
 
@@ -139,7 +139,7 @@ This reduces exposure a lot, but on a machine where others are administrators it
 - **While the session runs**, the login token is in the temp folder and in process memory. A local admin, or an Azure admin taking a disk snapshot, could read it. When the session ends it is signed out and deleted.
 - **Deleted files are removed normally, not wiped**, so forensic recovery is possible.
 - **The session runs without approvals** (`bypassPermissions` for Claude, `approval_policy = "never"` with no sandbox for Codex): the agent executes commands, edits files and runs MCP tools such as SQL queries without asking. Keep that in mind on customer environments.
-- **Codex remote control is experimental.** While it runs, a copy of the Codex daemon lives in the temp folder and may update itself; the script stops it and removes it at the end.
+- **Codex remote control is experimental.** On Windows the Codex background daemon refuses to run as administrator, and LCS VMs run the admin account elevated, often with UAC off. So the script runs `codex remote-control --no-daemon` in the foreground and requests the pairing code from its local socket itself, with the same request `codex remote-control pair` sends to the daemon. A future Codex release could change that request.
 - **Files Claude creates in your projects**, for example `.claude\settings.local.json`, are not removed. The script warns you if it finds one.
 - **Make sure your contract allows** sending the customer's code to an AI service.
 
