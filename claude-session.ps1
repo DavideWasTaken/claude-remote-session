@@ -186,11 +186,11 @@ function Get-ClaudeStatus {
     return $status
 }
 
-# Runs `claude auth login` with its output hidden. The link comes from browser.cmd (via BROWSER),
-# the code is read here masked and passed on stdin. Returns ok, invalid, failed or nolink.
-function Invoke-MaskedLogin([string]$urlFile) {
-    Remove-Item $urlFile -ErrorAction SilentlyContinue
-
+# Runs `claude auth login` with its output hidden. Claude prints two links: the one it hands to
+# BROWSER redirects to localhost on this VM, the one it prints ("visit: ...") shows a code to
+# paste - that's the one we want. The code is read here masked and passed on stdin.
+# Returns ok, invalid, failed or nolink.
+function Invoke-MaskedLogin {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $claude
     $psi.Arguments = 'auth login --claudeai'
@@ -199,20 +199,27 @@ function Invoke-MaskedLogin([string]$urlFile) {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $proc.StandardOutput.ReadToEndAsync()
     $stderr = $proc.StandardError.ReadToEndAsync()
 
+    $url = $null
+    $seen = ''
     $deadline = (Get-Date).AddSeconds(20)
-    while (-not (Test-Path $urlFile) -and -not $proc.HasExited -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 200
+    while (-not $url -and (Get-Date) -lt $deadline) {
+        $line = $proc.StandardOutput.ReadLineAsync()
+        if (-not $line.Wait([Math]::Max(1, [int]($deadline - (Get-Date)).TotalMilliseconds))) { break }
+        if ($null -eq $line.Result) { break }
+        $seen += $line.Result + "`n"
+        if ($line.Result -match '(https://\S+)' -and $Matches[1] -notmatch 'localhost') { $url = $Matches[1] }
     }
-    if (-not (Test-Path $urlFile)) {
+    if (-not $url) {
         try { $proc.Kill() } catch { }
         $proc.WaitForExit()
         return 'nolink'
     }
-    $url = (Get-Content $urlFile -Raw).Trim()
+    # Keep draining the output so Claude never blocks on a full pipe.
+    $stdout = $proc.StandardOutput.ReadToEndAsync()
 
+    Set-Clipboard -Value $url
     Write-Ok "Sign-in link copied to the clipboard"
     Write-Info "Open it in the browser on YOUR computer, sign in and copy the code you get."
     Write-Dim $url
@@ -240,7 +247,7 @@ function Invoke-MaskedLogin([string]$urlFile) {
         try { $proc.Kill() } catch { }
         $proc.WaitForExit()
     }
-    if (($stdout.Result + $stderr.Result) -match 'Invalid code') { return 'invalid' }
+    if (($seen + $stdout.Result + $stderr.Result) -match 'Invalid code') { return 'invalid' }
     if ($proc.ExitCode -eq 0) { return 'ok' }
     return 'failed'
 }
@@ -372,19 +379,13 @@ try {
   The remote session ends within a few seconds; the launcher then signs out and cleans up.
 "@ | Set-Content -Path (Join-Path $dir 'CLAUDE.md') -Encoding UTF8
 
-    # Claude Code opens the browser with the command in BROWSER: instead of the VM's browser this
-    # copies the link to the clipboard (RDP shares it with your computer) and hands it to us.
-    $urlFile = Join-Path $dir 'login-url.txt'
+    # Claude Code opens the browser with the command in BROWSER: a no-op keeps the VM's browser
+    # closed. The sign-in link goes to the clipboard instead (RDP shares it with your computer).
     $browserCmd = Join-Path $dir 'browser.cmd'
-    @'
-@echo off
-set "CC_LOGIN_URL=%~1"
-powershell -NoProfile -NonInteractive -Command "Set-Clipboard -Value $env:CC_LOGIN_URL; Set-Content -Path $env:CC_URL_FILE -Value $env:CC_LOGIN_URL -Encoding ascii"
-'@ | Set-Content -Path $browserCmd -Encoding ascii
+    '@exit /b 0' | Set-Content -Path $browserCmd -Encoding ascii
 
     $env:CLAUDE_CONFIG_DIR = $dir
     $env:BROWSER = $browserCmd
-    $env:CC_URL_FILE = $urlFile
 
     # -------------------------------------------------------------- 4. Sign in
     Write-Step "Sign in"
@@ -392,7 +393,7 @@ powershell -NoProfile -NonInteractive -Command "Set-Clipboard -Value $env:CC_LOG
 
     $result = ''
     for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $result = Invoke-MaskedLogin $urlFile
+        $result = Invoke-MaskedLogin
         if ($result -eq 'ok' -or $result -eq 'nolink') { break }
         if ($attempt -lt 3) {
             if ($result -eq 'invalid') { Write-Warn "That code wasn't accepted - here is a new link, try again." }
@@ -456,7 +457,7 @@ finally {
             & $claude auth logout *> $null
             Write-Ok "Signed out"
         }
-        Remove-Item Env:CLAUDE_CONFIG_DIR, Env:BROWSER, Env:CC_URL_FILE -ErrorAction SilentlyContinue
+        Remove-Item Env:CLAUDE_CONFIG_DIR, Env:BROWSER -ErrorAction SilentlyContinue
         Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 
         if (Test-Path $dir) {
