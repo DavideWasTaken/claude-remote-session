@@ -1,47 +1,87 @@
-# Sessione Remote Control usa-e-getta per una VM cliente.
+# claude-remote-session: a disposable Claude Code Remote Control session for a customer VM.
 #
-# 0. Se Claude Code non c'e', lo installa con l'installer ufficiale.
-# 1. Crea una cartella temporanea e la usa come CLAUDE_CONFIG_DIR: credenziali,
-#    cronologia e transcript finiscono li' e non in %USERPROFILE%\.claude.
-# 2. Copia nella sessione i server MCP gia' configurati sulla VM (Claude Code e
-#    Claude Desktop). Se non trova l'MCP D365 F&O lo aggiunge con -McpUrl, e se
-#    non risponde lo avvia con `d365fo-mcp start`.
-# 3. Login, poi `claude remote-control` con il nome scelto: la sessione compare
-#    nell'app Claude del tuo PC e la usi da li'.
-# 4. Quando la sessione termina (o la chiudi con "chiudi tutto") fa il logout ed
-#    elimina la cartella temporanea.
+# 1. Installs Claude Code with the official installer if it is missing.
+# 2. Points CLAUDE_CONFIG_DIR at a throwaway folder in %TEMP%: credentials, history and
+#    transcripts go there instead of %USERPROFILE%\.claude.
+# 3. Copies the MCP servers already configured on the VM (Claude Code and Claude Desktop).
+#    If there is no d365 server it adds -McpUrl; if it doesn't answer, runs `d365fo-mcp start`.
+# 4. Signs in without opening the VM's browser: the link goes to the clipboard and the code
+#    is read here, masked.
+# 5. Starts `claude remote-control` under the chosen name, in bypass-permissions mode.
+# 6. When the session ends ("stop session", archived in the app, or Ctrl+C) it signs out and
+#    deletes the throwaway folder.
 #
-# Uso:  doppio clic su claude-session.cmd. Il progetto lo indichi poi nella sessione
-#       ("usa il progetto X in Y"): Claude puo' lavorare su tutti i dischi locali.
-#       Il nome della sessione viene chiesto al primo avvio e salvato in session-name.txt.
-# Opzionali: -Project <cartella iniziale> -Name <nome sessione> -ExtraDirs <cartelle>
+# Usage:    double-click the launcher. Tell Claude which project to use from the chat
+#           ("use project X in Y"): it can access every local drive.
+#           The session name comes from session-name.txt next to this script (asked once).
+# Optional: -Project <start folder> -Name <session name> -ExtraDirs <folders> -McpUrl <url>
 
 param(
-    # Cartella iniziale; vuota = %USERPROFILE%\source\repos (o il profilo utente).
+    # Start folder; empty = %USERPROFILE%\source\repos (or the user profile).
     [string]$Project = '',
-    # Nome mostrato nell'app; vuoto = session-name.txt, o lo chiede al primo avvio.
+    # Name shown in the Claude app; empty = session-name.txt, asked on first run.
     [string]$Name = '',
-    # Cartelle accessibili oltre a quella iniziale; vuoto = tutti i dischi locali.
+    # Folders Claude may access besides the start folder; empty = every local fixed drive.
     [string[]]$ExtraDirs = @(),
-    # Usato solo se sulla VM non c'e' gia' una config MCP con "d365" nel nome.
+    # Used only when no MCP server with "d365" in its name is configured on the VM.
     [string]$McpUrl = 'http://127.0.0.1:8080/mcp'
 )
 
 $ErrorActionPreference = 'Stop'
 $prefix = 'cc-session-'
+$totalSteps = 5
 
 Add-Type -AssemblyName System.Web.Extensions
-# JavaScriptSerializer al posto di ConvertFrom-Json: in PowerShell 5.1 ConvertFrom-Json
-# fallisce su .claude.json quando ci sono progetti con lo stesso percorso in maiuscolo/minuscolo.
+# JavaScriptSerializer instead of ConvertFrom-Json: in PowerShell 5.1 ConvertFrom-Json fails on
+# .claude.json when two project paths differ only by case.
 $json = New-Object System.Web.Script.Serialization.JavaScriptSerializer
 $json.MaxJsonLength = [int]::MaxValue
+
+# Sends Ctrl+C to every process on this console, so Claude shuts down cleanly.
+Add-Type -Namespace Win32 -Name ConsoleCtrl -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+'@
+
+# ---------------------------------------------------------------- output
+
+function Write-Banner {
+    Write-Host ""
+    Write-Host "  Claude Remote Session" -ForegroundColor Cyan
+    Write-Host "  ---------------------" -ForegroundColor DarkCyan
+    Write-Host "  Disposable Claude Code Remote Control session - nothing of your account stays here." -ForegroundColor DarkGray
+}
+
+$script:step = 0
+function Write-Step([string]$text) {
+    $script:step++
+    Write-Host ""
+    Write-Host "[$($script:step)/$totalSteps] $text" -ForegroundColor Cyan
+}
+
+function Write-Section([string]$text) {
+    Write-Host ""
+    Write-Host "$text" -ForegroundColor Cyan
+}
+
+function Write-Ok([string]$text)   { Write-Host "  [ OK ] $text" -ForegroundColor Green }
+function Write-Warn([string]$text) { Write-Host "  [WARN] $text" -ForegroundColor Yellow }
+function Write-Fail([string]$text) { Write-Host "  [FAIL] $text" -ForegroundColor Red }
+function Write-Info([string]$text) { Write-Host "         $text" -ForegroundColor Gray }
+function Write-Dim([string]$text)  { Write-Host "         $text" -ForegroundColor DarkGray }
+
+function Write-Field([string]$label, [string]$value) {
+    Write-Host ("         {0,-9}" -f $label) -NoNewline -ForegroundColor DarkGray
+    Write-Host $value
+}
+
+# ---------------------------------------------------------------- helpers
 
 function Read-JsonFile([string]$path) {
     if (-not (Test-Path $path)) { return $null }
     try {
         return $json.DeserializeObject((Get-Content $path -Raw -Encoding UTF8))
     } catch {
-        Write-Warning "Non riesco a leggere $path, lo salto."
+        Write-Warn "Could not read $path, skipping it."
         return $null
     }
 }
@@ -50,10 +90,11 @@ function Write-JsonFile([string]$path, $value) {
     [IO.File]::WriteAllText($path, $json.Serialize($value))
 }
 
-# Elimina i residui di sessioni chiuse male, lasciando stare quelle ancora attive.
-# Su RDP %TEMP% e' per sessione (Temp\2, Temp\3...), quindi guarda anche nelle sottocartelle.
+# Removes leftovers of sessions that ended badly, leaving running ones alone.
+# Over RDP %TEMP% is per session (Temp\2, Temp\3...), so look in the subfolders too.
 function Remove-StaleSessions {
     $base = Join-Path $env:LOCALAPPDATA 'Temp'
+    $removed = 0
     Get-ChildItem -Path "$base\$prefix*", "$base\*\$prefix*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         $pidFile = Join-Path $_.FullName 'rc.pid'
         if (Test-Path $pidFile) {
@@ -61,10 +102,13 @@ function Remove-StaleSessions {
             if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) { return }
         }
         Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        $removed++
     }
+    return $removed
 }
 
-# Server MCP gia' presenti sulla VM: Claude Desktop, Claude Code (utente e progetto), mcp.json dello script.
+# MCP servers already on the VM: Claude Desktop, Claude Code (user and project), then mcp.json
+# next to this script, which wins.
 function Get-ExistingMcpServers([string]$projectKey) {
     $servers = @{}
 
@@ -90,7 +134,6 @@ function Get-ExistingMcpServers([string]$projectKey) {
         }
     }
 
-    # mcp.json accanto allo script: ha la precedenza e non dipende da Claude Desktop.
     $own = Read-JsonFile (Join-Path $PSScriptRoot 'mcp.json')
     if ($own -and $own.ContainsKey('mcpServers')) {
         foreach ($k in $own['mcpServers'].Keys) { $servers[$k] = $own['mcpServers'][$k] }
@@ -111,222 +154,323 @@ function Test-McpPort([string]$url) {
     }
 }
 
-# Se l'MCP d365 non risponde lo avvia con `d365fo-mcp start` e aspetta che apra la porta.
+# Starts the d365 MCP server with `d365fo-mcp start` if it doesn't answer, and waits for its port.
 function Start-D365Mcp([string]$url) {
-    if (Test-McpPort $url) { Write-Host "MCP d365 attivo su $url"; return }
+    if (Test-McpPort $url) { Write-Ok "d365 is up at $url"; return }
 
     if (-not (Get-Command d365fo-mcp -ErrorAction SilentlyContinue)) {
-        Write-Warning "MCP d365 non risponde su $url e il comando d365fo-mcp non e' installato."
+        Write-Warn "d365 is not answering at $url and 'd365fo-mcp' is not installed."
+        Write-Dim "Install it from https://github.com/dynamics365ninja/d365fo-mcp-server"
         return
     }
 
-    Write-Host "MCP d365 non risponde, lo avvio con 'd365fo-mcp start'..."
+    Write-Info "d365 is not answering - starting it with 'd365fo-mcp start'"
     Start-Process cmd.exe -ArgumentList '/c d365fo-mcp start' -WindowStyle Hidden | Out-Null
+    Write-Host "         waiting " -NoNewline -ForegroundColor DarkGray
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Seconds 1
-        if (Test-McpPort $url) { Write-Host "MCP d365 attivo su $url"; return }
+        Write-Host "." -NoNewline -ForegroundColor DarkGray
+        if (Test-McpPort $url) { Write-Host ""; Write-Ok "d365 is up at $url"; return }
     }
-    Write-Warning "MCP d365 ancora non risponde dopo 30 secondi: prova 'd365fo-mcp start' a mano."
+    Write-Host ""
+    Write-Warn "d365 still isn't answering after 30 seconds - try 'd365fo-mcp start' by hand."
 }
 
-# Percorso dell'installer standalone, usato anche se il PATH della shell non e' ancora aggiornato.
-$standalone = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+function Get-ClaudeStatus {
+    # In PowerShell 5.1 a native command's stderr becomes an error record: don't let it throw.
+    $ErrorActionPreference = 'Continue'
+    $text = (& $claude auth status 2>&1) -join "`n"
+    $status = @{ LoggedIn = ($LASTEXITCODE -eq 0 -and $text -match '"loggedIn"\s*:\s*true'); Email = ''; Plan = '' }
+    if ($text -match '"email"\s*:\s*"([^"]*)"') { $status.Email = $Matches[1] }
+    if ($text -match '"subscriptionType"\s*:\s*"([^"]*)"') { $status.Plan = $Matches[1] }
+    return $status
+}
 
-# Il prompt "Paste code here" di Claude Code non mostra nulla mentre incolli: qui il codice
-# lo legge lo script (con gli asterischi) e lo passa a `claude auth login` sullo standard input.
-function Invoke-MaskedLogin {
+# Runs `claude auth login` with its output hidden. The link comes from browser.cmd (via BROWSER),
+# the code is read here masked and passed on stdin. Returns ok, invalid, failed or nolink.
+function Invoke-MaskedLogin([string]$urlFile) {
+    Remove-Item $urlFile -ErrorAction SilentlyContinue
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $claude
     $psi.Arguments = 'auth login --claudeai'
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $proc.StandardOutput.ReadToEndAsync()
+    $stderr = $proc.StandardError.ReadToEndAsync()
 
-    # Lascia a Claude il tempo di stampare il link.
-    if ($proc.WaitForExit(4000)) { return ($proc.ExitCode -eq 0) }
+    $deadline = (Get-Date).AddSeconds(20)
+    while (-not (Test-Path $urlFile) -and -not $proc.HasExited -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not (Test-Path $urlFile)) {
+        try { $proc.Kill() } catch { }
+        $proc.WaitForExit()
+        return 'nolink'
+    }
+    $url = (Get-Content $urlFile -Raw).Trim()
 
+    Write-Ok "Sign-in link copied to the clipboard"
+    Write-Info "Open it in the browser on YOUR computer, sign in and copy the code you get."
+    Write-Dim $url
     Write-Host ""
-    $sec = Read-Host "Incolla qui il codice e premi Invio (vedrai degli asterischi)" -AsSecureString
+    try {
+        $sec = Read-Host "         Paste the code" -AsSecureString
+    } catch {
+        # Prompt interrupted: don't leave `claude auth login` running in the background.
+        try { $proc.Kill() } catch { }
+        throw
+    }
+
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
     try {
         $proc.StandardInput.WriteLine([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr))
     } catch {
-        # Claude ha gia' chiuso l'input (es. login completato dal browser della VM).
+        # Claude already closed its input (e.g. sign-in completed some other way).
     } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
     try { $proc.StandardInput.Close() } catch { }
 
-    # Con un codice sbagliato Claude lo richiede e resta in attesa: dopo 30 secondi si passa al login standard.
+    # With a wrong code Claude asks again and keeps waiting.
     if (-not $proc.WaitForExit(30000)) {
-        $proc.Kill()
-        return $false
+        try { $proc.Kill() } catch { }
+        $proc.WaitForExit()
     }
-    return ($proc.ExitCode -eq 0)
+    if (($stdout.Result + $stderr.Result) -match 'Invalid code') { return 'invalid' }
+    if ($proc.ExitCode -eq 0) { return 'ok' }
+    return 'failed'
 }
 
-function Test-LoggedIn {
-    $status = (& $claude auth status 2>&1) -join "`n"
-    return ($LASTEXITCODE -eq 0 -and $status -match '"loggedIn"\s*:\s*true')
-}
+# ---------------------------------------------------------------- main
 
-# Invia Ctrl+C a tutti i processi della console: Claude si chiude in modo pulito.
-Add-Type -Namespace Win32 -Name ConsoleCtrl -MemberDefinition @'
-[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
-'@
+$dir = $null
+$rc = $null
+$claude = $null
+$justInstalled = $false
+$signInStarted = $false
 
-$claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
-if (-not $claude -and (Test-Path $standalone)) { $claude = $standalone }
-if (-not $claude) {
-    Write-Host "Claude Code non trovato: lo installo con l'installer ufficiale (claude.ai/install.ps1)..."
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression
-    if (-not (Test-Path $standalone)) { throw "Installazione di Claude Code non riuscita." }
-    $claude = $standalone
-}
-Write-Host "Claude Code: $claude ($(& $claude --version))"
-
-if (-not $Project) {
-    $repos = Join-Path $env:USERPROFILE 'source\repos'
-    $Project = if (Test-Path $repos) { $repos } else { $env:USERPROFILE }
-}
-
-if (-not $Name) {
-    $nameFile = Join-Path $PSScriptRoot 'session-name.txt'
-    if (Test-Path $nameFile) { $Name = (Get-Content $nameFile -Raw).Trim() }
-    if (-not $Name) {
-        $Name = (Read-Host "Nome della sessione remota, es. il cliente (Invio = $env:COMPUTERNAME)").Trim()
-        if (-not $Name) { $Name = $env:COMPUTERNAME }
-        Set-Content -Path $nameFile -Value $Name -Encoding UTF8
-    }
-}
-
-if (-not $ExtraDirs.Count) {
-    $ExtraDirs = @([IO.DriveInfo]::GetDrives() |
-        Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
-        ForEach-Object { $_.RootDirectory.FullName })
-}
-
-$Project = (Resolve-Path $Project).Path
-$projectKey = $Project.Replace('\', '/').TrimEnd('/')
-
-Remove-StaleSessions
-
-$dir = Join-Path $env:TEMP ($prefix + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $dir | Out-Null
-
-$servers = Get-ExistingMcpServers $projectKey
-
-$d365Name = @($servers.Keys | Where-Object { $_ -match 'd365' }) | Select-Object -First 1
-if (-not $d365Name) {
-    $d365Name = 'd365'
-    $servers[$d365Name] = @{ type = 'http'; url = $McpUrl }
-    Write-Host "Nessuna config MCP d365 trovata: la creo con $McpUrl"
-}
-$d365Url = $servers[$d365Name]['url']
-if ($d365Url) { Start-D365Mcp $d365Url }
-# remoteDialogSeen: non chiede "Enable Remote Control? (y/n)".
-# bypassPermissionsModeAccepted: avviso della modalita' bypass gia' accettato.
-Write-JsonFile (Join-Path $dir '.claude.json') @{
-    hasCompletedOnboarding        = $true
-    remoteDialogSeen              = $true
-    bypassPermissionsModeAccepted = $true
-    mcpServers                    = $servers
-    projects                      = @{ $projectKey = @{ hasTrustDialogAccepted = $true } }
-}
-# Sessione senza richieste di permesso; accetta anche gli MCP del .mcp.json del progetto.
-$permissions = @{ defaultMode = 'bypassPermissions' }
-if ($ExtraDirs.Count) {
-    $permissions['additionalDirectories'] = @($ExtraDirs | ForEach-Object { (Resolve-Path $_).Path })
-}
-Write-JsonFile (Join-Path $dir 'settings.json') @{
-    enableAllProjectMcpServers        = $true
-    skipDangerousModePermissionPrompt = $true
-    permissions                       = $permissions
-}
-
-# "chiudi tutto" nella sessione crea stop.request: lo script lo vede e chiude Claude in modo pulito
-# (Ctrl+C), cosi' la sessione viene archiviata e non resta duplicata nell'elenco dell'app.
-$stopFile = Join-Path $dir 'stop.request'
-$stopScript = Join-Path $dir 'stop.ps1'
-"New-Item -ItemType File -Path '$stopFile' -Force | Out-Null" | Set-Content -Path $stopScript -Encoding ascii
-@"
-# Sessione remota temporanea
-- Puoi lavorare in queste cartelle: $($ExtraDirs -join ', ').
-- Quando l'utente indica un progetto o un percorso ("usa il progetto X in Y"), lavora li' usando percorsi
-  assoluti per leggere, modificare e lanciare comandi. Con get_workspace_info dell'MCP d365 controlla che
-  l'MCP punti allo stesso progetto, e se non e' cosi' diglielo.
-- Quando l'utente scrive "chiudi tutto", rispondi in una riga che stai chiudendo, poi esegui in
-  PowerShell: & '$stopScript'
-  Entro pochi secondi la sessione remota termina; lo script di avvio fa poi logout e pulizia.
-"@ | Set-Content -Path (Join-Path $dir 'CLAUDE.md') -Encoding UTF8
-
-# Claude Code apre il browser con il comando in BROWSER: al posto del browser della VM
-# copiamo il link negli appunti, che via RDP arrivano anche sul tuo PC.
-$browserCmd = Join-Path $dir 'browser.cmd'
-@'
-@echo off
-set "CC_LOGIN_URL=%~1"
-powershell -NoProfile -NonInteractive -Command "Set-Clipboard -Value $env:CC_LOGIN_URL"
-'@ | Set-Content -Path $browserCmd -Encoding ascii
-
-$env:CLAUDE_CONFIG_DIR = $dir
-$env:BROWSER = $browserCmd
+Write-Banner
 
 try {
-    Write-Host ""
-    Write-Host "Server MCP caricati: $(if ($servers.Count) { $servers.Keys -join ', ' } else { 'nessuno (verranno usati solo quelli del .mcp.json del progetto)' })"
-    Write-Host ""
-    Write-Host "Il browser della VM non si apre: il link di login viene copiato negli appunti." -ForegroundColor Yellow
-    Write-Host "Incollalo nel browser del TUO PC (o copialo da qui sotto); il codice lo incolli quando lo chiede lo script." -ForegroundColor Yellow
-    Write-Host ""
-    $rc = $null
+    # -------------------------------------------------------------- 1. Claude Code
+    Write-Step "Claude Code"
 
-    # Primo tentativo con gli asterischi; se non va, il login standard di Claude Code.
-    Invoke-MaskedLogin | Out-Null
-    for ($try = 1; $try -le 2 -and -not (Test-LoggedIn); $try++) {
-        Write-Host ""
-        Write-Host "Login non riuscito, riprovo con il login standard (qui il codice incollato non si vede)." -ForegroundColor Yellow
+    # Where the official installer puts it, also used when this shell's PATH isn't updated yet.
+    $standalone = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+    $claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
+    if (-not $claude -and (Test-Path $standalone)) { $claude = $standalone }
+    if (-not $claude) {
+        Write-Info "Not installed - installing with the official installer (claude.ai/install.ps1)."
+        Write-Dim "This can take a minute..."
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try {
+            Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression *> $null
+        } catch {
+            throw "Claude Code installation failed: $($_.Exception.Message)"
+        }
+        if (-not (Test-Path $standalone)) { throw "Claude Code installation failed: claude.exe not found after install." }
+        $claude = $standalone
+        $justInstalled = $true
+    }
+    $version = ((& $claude --version) -replace '\s*\(Claude Code\)', '').Trim()
+    if ($justInstalled) { Write-Ok "Claude Code $version installed" } else { Write-Ok "Claude Code $version" }
+    Write-Dim $claude
+
+    # -------------------------------------------------------------- 2. Session
+    Write-Step "Session"
+
+    if (-not $Project) {
+        $repos = Join-Path $env:USERPROFILE 'source\repos'
+        $Project = if (Test-Path $repos) { $repos } else { $env:USERPROFILE }
+    }
+    $Project = (Resolve-Path $Project).Path
+    $projectKey = $Project.Replace('\', '/').TrimEnd('/')
+
+    if (-not $Name) {
+        $nameFile = Join-Path $PSScriptRoot 'session-name.txt'
+        if (Test-Path $nameFile) { $Name = (Get-Content $nameFile -Raw).Trim() }
+        if (-not $Name) {
+            $Name = (Read-Host "         Session name, e.g. the customer [Enter = $env:COMPUTERNAME]").Trim()
+            if (-not $Name) { $Name = $env:COMPUTERNAME }
+            Set-Content -Path $nameFile -Value $Name -Encoding UTF8
+        }
+    }
+
+    if (-not $ExtraDirs.Count) {
+        $ExtraDirs = @([IO.DriveInfo]::GetDrives() |
+            Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
+            ForEach-Object { $_.RootDirectory.FullName })
+    }
+    $ExtraDirs = @($ExtraDirs | ForEach-Object { (Resolve-Path $_).Path })
+
+    Write-Field 'Name' $Name
+    Write-Field 'Start in' $Project
+    Write-Field 'Access' ($ExtraDirs -join '  ')
+
+    $removed = Remove-StaleSessions
+    if ($removed) { Write-Info "Removed $removed leftover folder(s) from earlier sessions." }
+
+    $dir = Join-Path $env:TEMP ($prefix + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    Write-Ok "Throwaway config folder ready"
+    Write-Dim $dir
+
+    # -------------------------------------------------------------- 3. MCP servers
+    Write-Step "MCP servers"
+
+    $servers = Get-ExistingMcpServers $projectKey
+    $d365Name = @($servers.Keys | Where-Object { $_ -match 'd365' }) | Select-Object -First 1
+    if (-not $d365Name) {
+        $d365Name = 'd365'
+        $servers[$d365Name] = @{ type = 'http'; url = $McpUrl }
+        Write-Warn "No d365 MCP config found on this VM - using $McpUrl"
+    }
+    foreach ($k in $servers.Keys) {
+        $s = $servers[$k]
+        $target = if ($s['url']) { $s['url'] } else { $s['command'] }
+        Write-Field $k $target
+    }
+    $d365Url = $servers[$d365Name]['url']
+    if ($d365Url) { Start-D365Mcp $d365Url }
+
+    # remoteDialogSeen: skips "Enable Remote Control? (y/n)".
+    # bypassPermissionsModeAccepted: the bypass-mode warning counts as accepted.
+    Write-JsonFile (Join-Path $dir '.claude.json') @{
+        hasCompletedOnboarding        = $true
+        remoteDialogSeen              = $true
+        bypassPermissionsModeAccepted = $true
+        mcpServers                    = $servers
+        projects                      = @{ $projectKey = @{ hasTrustDialogAccepted = $true } }
+    }
+    # No permission prompts; also accept the MCP servers in the project's .mcp.json.
+    Write-JsonFile (Join-Path $dir 'settings.json') @{
+        enableAllProjectMcpServers        = $true
+        skipDangerousModePermissionPrompt = $true
+        permissions                       = @{
+            defaultMode           = 'bypassPermissions'
+            additionalDirectories = $ExtraDirs
+        }
+    }
+
+    # "stop session" in the chat creates stop.request: this script sees it and stops Claude
+    # cleanly (Ctrl+C), so the session gets archived instead of piling up in the app.
+    $stopFile = Join-Path $dir 'stop.request'
+    $stopScript = Join-Path $dir 'stop.ps1'
+    "New-Item -ItemType File -Path '$stopFile' -Force | Out-Null" | Set-Content -Path $stopScript -Encoding ascii
+    @"
+# Temporary remote session
+- You can work in these folders: $($ExtraDirs -join ', ').
+- When the user names a project or a path ("use project X in Y"), work there, using absolute paths
+  to read, edit and run commands. Use get_workspace_info from the d365 MCP to check that the MCP
+  points at the same project, and tell the user if it doesn't.
+- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing,
+  then run in PowerShell: & '$stopScript'
+  The remote session ends within a few seconds; the launcher then signs out and cleans up.
+"@ | Set-Content -Path (Join-Path $dir 'CLAUDE.md') -Encoding UTF8
+
+    # Claude Code opens the browser with the command in BROWSER: instead of the VM's browser this
+    # copies the link to the clipboard (RDP shares it with your computer) and hands it to us.
+    $urlFile = Join-Path $dir 'login-url.txt'
+    $browserCmd = Join-Path $dir 'browser.cmd'
+    @'
+@echo off
+set "CC_LOGIN_URL=%~1"
+powershell -NoProfile -NonInteractive -Command "Set-Clipboard -Value $env:CC_LOGIN_URL; Set-Content -Path $env:CC_URL_FILE -Value $env:CC_LOGIN_URL -Encoding ascii"
+'@ | Set-Content -Path $browserCmd -Encoding ascii
+
+    $env:CLAUDE_CONFIG_DIR = $dir
+    $env:BROWSER = $browserCmd
+    $env:CC_URL_FILE = $urlFile
+
+    # -------------------------------------------------------------- 4. Sign in
+    Write-Step "Sign in"
+    $signInStarted = $true
+
+    $result = ''
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $result = Invoke-MaskedLogin $urlFile
+        if ($result -eq 'ok' -or $result -eq 'nolink') { break }
+        if ($attempt -lt 3) {
+            if ($result -eq 'invalid') { Write-Warn "That code wasn't accepted - here is a new link, try again." }
+            else { Write-Warn "Sign-in didn't complete - here is a new link, try again." }
+            Write-Host ""
+        }
+    }
+    if ($result -eq 'nolink') {
+        Write-Warn "Couldn't capture the sign-in link - falling back to Claude Code's own sign-in."
+        Write-Dim "The code you paste there stays invisible: paste it once and press Enter."
         & $claude auth login --claudeai
     }
-    if (-not (Test-LoggedIn)) { throw "Login non riuscito." }
-    Write-Host "Login riuscito." -ForegroundColor Green
+
+    $status = Get-ClaudeStatus
+    if (-not $status.LoggedIn) { throw "Sign-in failed." }
+    $who = $status.Email
+    if ($status.Plan) { $who = "$who ($($status.Plan))" }
+    Write-Ok "Signed in as $who"
+
+    # -------------------------------------------------------------- 5. Remote session
+    Write-Step "Remote session"
 
     $rcArgs = "remote-control --name `"$Name`" --spawn session --permission-mode bypassPermissions"
+    Write-Field 'Session' $Name
+    Write-Field 'Mode' 'bypass permissions (no prompts)'
+    Write-Host ""
+    Write-Info "Open '$Name' from the Claude app on your computer."
+    Write-Info "You can close RDP now with the X - do NOT sign out of Windows."
+    Write-Info "To end it: type 'stop session' in the chat, archive it in the app, or press Ctrl+C here."
+    Write-Host ""
+
     $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru
     $rc.Id | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
 
-    Write-Host ""
-    Write-Host "Sessione '$Name' attiva. Puoi chiudere RDP con la X (NON con Disconnetti/Esci)." -ForegroundColor Green
-    Write-Host "Per terminare: scrivi 'chiudi tutto' nella sessione, chiudila dall'app, oppure Ctrl+C qui." -ForegroundColor Green
-
     while (-not $rc.WaitForExit(1000)) {
         if (Test-Path $stopFile) {
-            Write-Host "Richiesta di chiusura ricevuta, chiudo la sessione..." -ForegroundColor Yellow
-            # Ctrl+C arriva anche a questo script, che passa subito al blocco finally.
+            Write-Section "Stop requested from the session - shutting down..."
+            # Ctrl+C also reaches this script, which goes straight to the finally block.
             [Win32.ConsoleCtrl]::GenerateConsoleCtrlEvent(0, 0) | Out-Null
             $rc.WaitForExit(30000) | Out-Null
             break
         }
     }
 }
+catch {
+    Write-Host ""
+    Write-Fail $_.Exception.Message
+}
 finally {
-    # Lascia a Claude il tempo di archiviare la sessione prima del logout; se non basta, lo termina.
+    # Cleanup must always run to the end, whatever the native commands print on stderr.
+    $ErrorActionPreference = 'Continue'
+
+    # Give Claude time to archive the session before signing out; kill it if that's not enough.
     if ($rc -and -not $rc.HasExited -and -not $rc.WaitForExit(30000)) {
         taskkill /PID $rc.Id /T /F *> $null
     }
-    & $claude auth logout *> $null
-    Remove-Item Env:CLAUDE_CONFIG_DIR, Env:BROWSER -ErrorAction SilentlyContinue
-    Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 
-    if (Test-Path $dir) {
-        Write-Host "ATTENZIONE: non sono riuscito a cancellare $dir. Eliminala a mano." -ForegroundColor Red
-    } else {
-        Write-Host "Sessione chiusa: logout fatto e file di sessione eliminati." -ForegroundColor Green
-    }
+    if ($dir) {
+        Write-Section "Cleaning up"
+        if ($signInStarted -and $claude) {
+            & $claude auth logout *> $null
+            Write-Ok "Signed out"
+        }
+        Remove-Item Env:CLAUDE_CONFIG_DIR, Env:BROWSER, Env:CC_URL_FILE -ErrorAction SilentlyContinue
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 
-    $local = Join-Path $Project '.claude\settings.local.json'
-    if (Test-Path $local) {
-        Write-Host "Nota: nel progetto esiste $local (permessi salvati con 'non chiedere piu')." -ForegroundColor Yellow
+        if (Test-Path $dir) {
+            Write-Fail "Couldn't delete $dir - remove it by hand."
+        } else {
+            Write-Ok "Session files deleted"
+        }
+
+        $local = Join-Path $Project '.claude\settings.local.json'
+        if (Test-Path $local) {
+            Write-Warn "$local exists (permissions saved from a session) - delete it if you don't need it."
+        }
+        Write-Host ""
+        Write-Host "  Done. Nothing from this session is left in your Claude config on this machine." -ForegroundColor Green
     }
+    Write-Host ""
 }

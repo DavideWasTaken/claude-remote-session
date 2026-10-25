@@ -62,7 +62,33 @@ If you'd rather install by hand, copy `claude-session.ps1` and `claude-session.c
 3. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 4. Open the session from the Claude app on your PC and tell it what to work on, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
-To end the session, type **"chiudi tutto"** in the session, archive it from the app, or press Ctrl+C in the VM console. The script then signs out and deletes the temp folder.
+To end the session, type **"stop session"** in the chat, archive it from the app, or press Ctrl+C in the VM console. The script then signs out and deletes the temp folder.
+
+The console walks you through five steps:
+
+```
+  Claude Remote Session
+  ---------------------
+
+[1/5] Claude Code
+  [ OK ] Claude Code 2.1.310
+[2/5] Session
+         Name     Contoso
+         Start in C:\Users\Admin\source\repos
+         Access   C:\  K:\
+  [ OK ] Throwaway config folder ready
+[3/5] MCP servers
+         d365     http://127.0.0.1:8080/mcp
+  [ OK ] d365 is up at http://127.0.0.1:8080/mcp
+[4/5] Sign in
+  [ OK ] Sign-in link copied to the clipboard
+         Open it in the browser on YOUR computer, sign in and copy the code you get.
+         Paste the code: ****************
+  [ OK ] Signed in as you@example.com (max)
+[5/5] Remote session
+         Session  Contoso
+         Mode     bypass permissions (no prompts)
+```
 
 ### Optional parameters
 
@@ -90,8 +116,6 @@ This reduces exposure a lot, but on a machine where others are administrators it
 - **The session runs with `bypassPermissions`**: Claude executes commands, edits files and runs MCP tools such as SQL queries without asking. Keep that in mind on customer environments.
 - **Files Claude creates in your projects**, for example `.claude\settings.local.json`, are not removed. The script warns you if it finds one.
 - **Make sure your contract allows** sending the customer's code to an AI service.
-
-Console messages and the in-session instructions are in Italian.
 
 ## License
 
