@@ -1,4 +1,4 @@
-# claude-remote-session
+# d365fo-claude-remote-session
 
 Start a disposable Claude Code **Remote Control** session on a customer's VM with one double-click, and drive it from your own machine. Nothing of your account stays on the VM.
 
@@ -42,7 +42,7 @@ This script lets you:
 On the VM, open PowerShell and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/DavideWasTaken/claude-remote-session/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/DavideWasTaken/d365fo-claude-remote-session/main/install.ps1 | iex
 ```
 
 It asks for a session name (for example the customer's name, or press Enter to use the computer name), then creates:

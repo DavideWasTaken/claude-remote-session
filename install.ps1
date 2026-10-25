@@ -1,13 +1,13 @@
-# Installs claude-remote-session:
+# Installs d365fo-claude-remote-session:
 # - Documents\claude-remote-session\claude-session.ps1 and session-name.txt
 # - Desktop\Claude Remote Session.cmd, the double-click launcher
 #
-# Usage:  irm https://raw.githubusercontent.com/DavideWasTaken/claude-remote-session/main/install.ps1 | iex
+# Usage:  irm https://raw.githubusercontent.com/DavideWasTaken/d365fo-claude-remote-session/main/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$repoRaw = 'https://raw.githubusercontent.com/DavideWasTaken/claude-remote-session/main'
+$repoRaw = 'https://raw.githubusercontent.com/DavideWasTaken/d365fo-claude-remote-session/main'
 $installDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'claude-remote-session'
 $desktop = [Environment]::GetFolderPath('Desktop')
 $script = Join-Path $installDir 'claude-session.ps1'
@@ -37,7 +37,7 @@ try {
 
     @"
 @echo off
-rem Starts a disposable Claude Code Remote Control session (claude-remote-session).
+rem Starts a disposable Claude Code Remote Control session (d365fo-claude-remote-session).
 powershell -NoProfile -ExecutionPolicy Bypass -File "$script" %*
 pause
 "@ | Set-Content -Path $launcher -Encoding ascii

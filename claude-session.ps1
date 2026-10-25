@@ -1,4 +1,4 @@
-# claude-remote-session: a disposable Claude Code Remote Control session for a customer VM.
+# d365fo-claude-remote-session: a disposable Claude Code Remote Control session for a customer VM.
 #
 # 1. Installs Claude Code with the official installer if it is missing.
 # 2. Points CLAUDE_CONFIG_DIR at a throwaway folder in %TEMP%: credentials, history and
