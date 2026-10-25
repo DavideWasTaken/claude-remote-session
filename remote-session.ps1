@@ -520,8 +520,11 @@ Write-Banner
 $settings = Read-SessionSettings
 $changed = -not (Test-Path $settingsFile)
 if (-not $Agent) {
-    $Agent = $settings.agent.ToLower()
-    if ($Agent -notin 'claude', 'codex') {
+    # $Agent keeps its ValidateSet: only ever assign it claude or codex.
+    $saved = $settings.agent.ToLower()
+    if ($saved -in 'claude', 'codex') {
+        $Agent = $saved
+    } else {
         Write-Host ""
         Write-Host "         Agent    [1] Claude Code   [2] Codex (experimental)"
         $choice = (Read-Host "         Choose [Enter = 1]").Trim()
