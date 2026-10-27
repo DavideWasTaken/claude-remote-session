@@ -4,16 +4,22 @@
 #    registry, or a git checkout linked with `npm link` (any fork, on the branch it tracks).
 # 2. Checks whether there is anything to update: a newer release on npm, new commits upstream,
 #    or a C# bridge built from older sources. If not, it leaves the server alone.
-# 3. Stops the server running from that installation (and its bridge), since Windows won't let
-#    npm or dotnet replace files a running process holds open.
+# 3. Stops the HTTP server running from that installation (and its bridge), since Windows won't
+#    let npm or dotnet replace files a running process holds open. stdio servers, which Claude
+#    Code, VS Code or Visual Studio start and nobody but them can start again, are stopped only
+#    when the update can't work around them (npm reinstall, new bridge or dependencies), and
+#    only after asking.
 # 4. Runs `d365fo-mcp update --yes`, which pulls or reinstalls, builds and rebuilds the bridge.
-# 5. Starts the server again with `d365fo-mcp start` if it was running, and waits for its port.
+# 5. Starts the HTTP server again with `d365fo-mcp start` if it was running, and waits for its port.
 #
-# Usage:    double-click the launcher. Optional: -McpUrl <url> (default http://127.0.0.1:8080/mcp)
+# Usage:    double-click the launcher.
+# Optional: -McpUrl <url> (default http://127.0.0.1:8080/mcp) -Yes (stop stdio servers without asking)
 
 param(
-    # Where the HTTP server answers; used to tell whether it was running and to wait for it.
-    [string]$McpUrl = 'http://127.0.0.1:8080/mcp'
+    # Where the HTTP server answers; used to find it and to wait for it after the restart.
+    [string]$McpUrl = 'http://127.0.0.1:8080/mcp',
+    # Stop stdio servers without asking, when the update needs them stopped.
+    [switch]$Yes
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,6 +92,29 @@ function Get-ServerProcesses {
         }
 }
 
+# Groups the server processes by the topmost one of each tree: a stdio server with its bridge, or
+# the `d365fo-mcp start` CLI with the HTTP server under it. The HTTP group is the one holding the
+# MCP port.
+function Get-ServerGroups([object[]]$procs) {
+    $byId = @{}
+    foreach ($p in $procs) { $byId[[int]$p.ProcessId] = $p }
+    $port = ([Uri]$McpUrl).Port
+    $listener = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object OwningProcess)
+    $groups = @{}
+    foreach ($p in $procs) {
+        $top = $p
+        while ($byId.ContainsKey([int]$top.ParentProcessId)) { $top = $byId[[int]$top.ParentProcessId] }
+        $id = [int]$top.ProcessId
+        if (-not $groups.ContainsKey($id)) {
+            $client = Get-Process -Id $top.ParentProcessId -ErrorAction SilentlyContinue
+            $groups[$id] = [pscustomobject]@{ Top = $top; Ids = @(); Http = $false; Client = $(if ($client) { $client.ProcessName } else { 'none' }) }
+        }
+        $groups[$id].Ids += [int]$p.ProcessId
+        if ($listener -contains $p.ProcessId) { $groups[$id].Http = $true }
+    }
+    return @($groups.Values)
+}
+
 # Stops a process together with everything it started (the bridge is a child of the server).
 function Stop-ProcessTree([int]$id) {
     Get-CimInstance Win32_Process -Filter "ParentProcessId=$id" -ErrorAction SilentlyContinue |
@@ -152,7 +181,12 @@ function Update-D365Mcp {
             Invoke-Git log --oneline 'HEAD..@{u}' | Select-Object -First 20 | ForEach-Object { Write-Dim $_ }
             if ($behind -gt 20) { Write-Dim "... and $($behind - 20) more" }
         }
+        # A running server only gets in the way of a new bridge (its exe is locked) or new dependencies
+        # (native modules are locked): compiled JavaScript can be replaced under it.
+        $locking = [bool]((Invoke-Git diff --name-only HEAD '@{u}') -match '^(bridge/|package(-lock)?\.json$)')
     } else {
+        # npm renames the whole package folder aside, which fails while any process runs from it.
+        $locking = $true
         $saved = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         $latest = (& npm.cmd view d365fo-mcp version 2>$null | Select-Object -Last 1)
@@ -164,7 +198,7 @@ function Update-D365Mcp {
         }
     }
     $bridge = Get-BridgeFreshness
-    if ($bridge -in 'stale', 'unstamped') { $reasons += "the C# bridge is $bridge" }
+    if ($bridge -in 'stale', 'unstamped') { $reasons += "the C# bridge is $bridge"; $locking = $true }
 
     Write-Host ""
     if (-not $reasons) {
@@ -173,17 +207,32 @@ function Update-D365Mcp {
     }
     Write-Info "Updating: $($reasons -join ', ')."
 
-    # ---- stop the server
-    $wasUp = Test-McpPort $McpUrl
-    $procs = @(Get-ServerProcesses)
-    if ($procs) {
-        Write-Info "Stopping the server (PID $(($procs | ForEach-Object ProcessId) -join ', '))"
-        $procs | ForEach-Object { Stop-ProcessTree $_.ProcessId }
-        Start-Sleep -Seconds 2
-        Write-Ok 'Server stopped'
-    } elseif ($wasUp) {
+    # ---- stop the servers: the HTTP one always (it comes back below), stdio ones only if they're in the way
+    $groups = @(Get-ServerGroups @(Get-ServerProcesses))
+    $http = @($groups | Where-Object Http)
+    $stdio = @($groups | Where-Object { -not $_.Http })
+    $wasUp = $http.Count -gt 0
+    if (-not $wasUp -and (Test-McpPort $McpUrl)) {
         Write-Warn "Something else answers at $McpUrl, not this installation: leaving it running."
-        $wasUp = $false
+    }
+    if ($stdio) {
+        Write-Info "$($stdio.Count) stdio server(s) run from this installation, started by: $(($stdio | ForEach-Object Client | Sort-Object -Unique) -join ', ')"
+        if ($locking) {
+            Write-Warn 'This update replaces files they hold open, so they have to be stopped.'
+            Write-Dim 'Their client loses the d365 tools until it starts them again (Claude Code: a new session).'
+            $answer = if ($Yes) { 'y' } else { "$(Read-Host '         Stop them and update? [y/N]')".Trim() }
+            if ($answer -notin 'y', 'yes', 's', 'si') { Write-Info 'Nothing changed.'; return $true }
+        } else {
+            Write-Dim 'They keep running the version they started with until their client restarts them.'
+            $stdio = @()
+        }
+    }
+    $stop = @($http) + @($stdio)
+    if ($stop) {
+        Write-Info "Stopping PID $(($stop | ForEach-Object { $_.Ids }) -join ', ')"
+        $stop | ForEach-Object { Stop-ProcessTree $_.Top.ProcessId }
+        Start-Sleep -Seconds 2
+        Write-Ok 'Stopped'
     }
 
     # ---- update; not from inside the package, which npm renames aside while it reinstalls
@@ -200,7 +249,8 @@ function Update-D365Mcp {
 
     # ---- put the server back, also after a failed update: a failed pull leaves the old code in place
     if ($wasUp) { if (-not (Start-D365Mcp $McpUrl)) { return $false } }
-    else { Write-Dim "The server wasn't running: the next Remote Session starts it." }
+    elseif (-not $groups) { Write-Dim "No server was running: the next Remote Session starts it." }
+    if ($stdio) { Write-Info 'Start a new Remote Session (or restart the IDE) to get the d365 tools back.' }
     return ($rc -eq 0)
 }
 

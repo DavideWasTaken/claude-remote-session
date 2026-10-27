@@ -140,7 +140,10 @@ Double-click **Update d365fo-mcp** on the Desktop. It works for both ways of ins
 - **npm install** (`npm install -g d365fo-mcp`): updates when a newer release is on npm;
 - **git checkout** linked with `npm link`, from the original repository or a fork: updates when the branch it tracks has new commits. It stops if the checkout has uncommitted changes.
 
-When there is something to update (or the C# bridge was built from older sources), it stops the server running from that installation, together with its bridge, because Windows won't let npm or dotnet replace files in use. It then runs `d365fo-mcp update --yes` and starts the server again with `d365fo-mcp start`, if it was running. If nothing changed, the server is left alone. If a Remote Session is open while you update and the d365 tools stop answering, end it and start a new one.
+When there is something to update (or the C# bridge was built from older sources), it runs `d365fo-mcp update --yes`. If nothing changed, no server is touched. Around the update:
+
+- **HTTP server** (`d365fo-mcp start`, port 8080): stopped together with its bridge, because Windows won't let npm or dotnet replace files in use, then started again.
+- **stdio servers** (started by Claude Code, VS Code or Visual Studio, including an open Remote Session): only their client can start them again. They are left running when the update only changes JavaScript, and keep the old version until their client restarts them. When the update can't work around them (npm reinstall, a new bridge or new dependencies), it asks before stopping them. After that, start a new Remote Session to get the d365 tools back. `-Yes` stops them without asking.
 
 The metadata index is not rebuilt. Run `d365fo-mcp index` by hand after a D365FO platform upgrade.
 

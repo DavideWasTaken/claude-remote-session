@@ -51,6 +51,8 @@ try {
     }
     $oldNameFile = Join-Path $oldDir 'session-name.txt'
     if (-not $settings.name -and (Test-Path $oldNameFile)) { $settings.name = (Get-Content $oldNameFile -Raw).Trim() }
+    # The old install only ran Claude Code.
+    if (-not $settings.agent -and (Test-Path $oldDir)) { $settings.agent = 'claude' }
 
     if (-not $settings.name) {
         Write-Host ""
