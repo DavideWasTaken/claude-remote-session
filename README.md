@@ -50,7 +50,8 @@ It asks for a session name (for example the customer's name, or press Enter to u
 
 - `Documents\remote-session\remote-session.ps1`: the script;
 - `Documents\remote-session\session.ini`: the session name and the agent, which you can edit at any time;
-- `Desktop\Remote Session.cmd`: the double-click launcher.
+- `Desktop\Remote Session.cmd`: the double-click launcher;
+- `Documents\remote-session\update-mcp.ps1` and `Desktop\Update d365fo-mcp.cmd`: the d365fo-mcp updater, only if `d365fo-mcp` is installed (see [Updating d365fo-mcp](#updating-d365fo-mcp)).
 
 `session.ini` looks like this; set `agent` to `claude` or `codex` to switch:
 
@@ -61,7 +62,7 @@ agent=claude
 
 Run the same command again to update the script. Your settings are kept. An install of the old `d365fo-claude-remote-session` is replaced: its session name and `mcp.json` are carried over, and the old folder and launcher are removed.
 
-If you'd rather install by hand, copy `remote-session.ps1` and `remote-session.cmd` into the same folder and double-click the `.cmd`. It asks for the agent and the session name on the first run.
+If you'd rather install by hand, copy `remote-session.ps1` and `remote-session.cmd` into the same folder and double-click the `.cmd`. It asks for the agent and the session name on the first run. The updater works the same way: `update-mcp.ps1` and `update-mcp.cmd`.
 
 ## Usage
 
@@ -131,6 +132,17 @@ To force a specific MCP configuration on a VM, put an `mcp.json` next to the scr
 ```json
 { "mcpServers": { "d365": { "type": "http", "url": "http://127.0.0.1:8080/mcp" } } }
 ```
+
+## Updating d365fo-mcp
+
+Double-click **Update d365fo-mcp** on the Desktop. It works for both ways of installing the server:
+
+- **npm install** (`npm install -g d365fo-mcp`): updates when a newer release is on npm;
+- **git checkout** linked with `npm link`, from the original repository or a fork: updates when the branch it tracks has new commits. It stops if the checkout has uncommitted changes.
+
+When there is something to update (or the C# bridge was built from older sources), it stops the server running from that installation, together with its bridge, because Windows won't let npm or dotnet replace files in use. It then runs `d365fo-mcp update --yes` and starts the server again with `d365fo-mcp start`, if it was running. If nothing changed, the server is left alone. If a Remote Session is open while you update and the d365 tools stop answering, end it and start a new one.
+
+The metadata index is not rebuilt. Run `d365fo-mcp index` by hand after a D365FO platform upgrade.
 
 ## Security notes
 

@@ -1,6 +1,7 @@
 # Installs d365fo-remote-session:
 # - Documents\remote-session\remote-session.ps1 and session.ini (session name and agent)
 # - Desktop\Remote Session.cmd, the double-click launcher
+# - Documents\remote-session\update-mcp.ps1 and Desktop\Update d365fo-mcp.cmd, when d365fo-mcp is installed
 # Replaces an install of the old d365fo-claude-remote-session, keeping its session name.
 #
 # Usage:  irm https://raw.githubusercontent.com/DavideWasTaken/d365fo-remote-session/main/install.ps1 | iex
@@ -23,6 +24,8 @@ $installDir = Join-Path $documents 'remote-session'
 $script = Join-Path $installDir 'remote-session.ps1'
 $settingsFile = Join-Path $installDir 'session.ini'
 $launcher = Join-Path $desktop 'Remote Session.cmd'
+$updater = Join-Path $installDir 'update-mcp.ps1'
+$updaterLauncher = Join-Path $desktop 'Update d365fo-mcp.cmd'
 # Where d365fo-claude-remote-session installed itself.
 $oldDir = Join-Path $documents 'claude-remote-session'
 $oldLauncher = Join-Path $desktop 'Claude Remote Session.cmd'
@@ -73,6 +76,19 @@ pause
 "@ | Set-Content -Path $launcher -Encoding ascii
     Write-Host "  [ OK ] Desktop launcher created" -ForegroundColor Green
 
+    # The d365fo-mcp updater only makes sense where the server is installed.
+    $hasMcp = [bool](Get-Command d365fo-mcp -ErrorAction SilentlyContinue)
+    if ($hasMcp) {
+        Invoke-WebRequest "$repoRaw/update-mcp.ps1" -OutFile $updater -UseBasicParsing
+        @"
+@echo off
+rem Updates d365fo-mcp and restarts its server (d365fo-remote-session).
+powershell -NoProfile -ExecutionPolicy Bypass -File "$updater" %*
+pause
+"@ | Set-Content -Path $updaterLauncher -Encoding ascii
+        Write-Host "  [ OK ] d365fo-mcp updater created" -ForegroundColor Green
+    }
+
     if ((Test-Path $oldDir) -or (Test-Path $oldLauncher)) {
         # An mcp.json placed next to the old script still applies.
         $oldMcp = Join-Path $oldDir 'mcp.json'
@@ -87,8 +103,11 @@ pause
     Write-Host ("         {0,-9}{1}" -f 'Script', $script) -ForegroundColor DarkGray
     Write-Host ("         {0,-9}{1}" -f 'Settings', $settingsFile) -ForegroundColor DarkGray
     Write-Host ("         {0,-9}{1}" -f 'Launcher', $launcher) -ForegroundColor DarkGray
+    if ($hasMcp) { Write-Host ("         {0,-9}{1}" -f 'Updater', $updaterLauncher) -ForegroundColor DarkGray }
     Write-Host ""
     Write-Host "  Double-click 'Remote Session' on the Desktop to start." -ForegroundColor Green
+    if ($hasMcp) { Write-Host "  Double-click 'Update d365fo-mcp' to update the MCP server and restart it." -ForegroundColor Green }
+    else { Write-Host "  d365fo-mcp isn't installed: run this installer again after installing it to get its updater." -ForegroundColor DarkGray }
     Write-Host "  Edit session.ini to change the name or switch between claude and codex." -ForegroundColor DarkGray
     Write-Host ""
 }
